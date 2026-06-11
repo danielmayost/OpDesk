@@ -47,7 +47,7 @@ import {
 import { quickRanges, type DateRange } from './components/analyticsUtils';
 
 type TabType = 'extensions' | 'calls' | 'queues' | 'call-log' | 'groups' | 'users' | 'analytics';
-const LANGUAGE_OPTIONS = ['en', 'ar', 'es', 'pt'] as const;
+const LANGUAGE_OPTIONS = ['en', 'ar', 'es', 'pt', 'he'] as const;
 
 function formatNotifTime(iso: string, t: (key: string, opts?: Record<string, unknown>) => string): string {
   const d = new Date(iso);
