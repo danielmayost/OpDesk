@@ -1,0 +1,55 @@
+# Pure-Asterisk lab + OpDesk operator panel (live calls + listen/whisper/barge).
+#
+# OpDesk normally requires FreePBX/Issabel (its MySQL schema for extensions/queues and
+# CDR). This stack runs OpDesk against PLAIN Asterisk:
+#   - extension/queue inventory is discovered live over AMI (no FreePBX schema)
+#   - the only database is OpDesk's own (users/auth/settings)
+#   - call-log/analytics/WebRTC-softphone are intentionally disabled (see opdesk/.env)
+#
+# Access the panel at  http://localhost:8765   (admin / opdesk1234 by default).
+
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: opdesk-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: OpDeskRoot123!
+      # Pre-creates the OpDesk database and grants the OpDesk user on it. The schema
+      # (tables + default admin) is then loaded from the mounted init script below.
+      MARIADB_DATABASE: OpDesk
+      MARIADB_USER: OpDesk
+      MARIADB_PASSWORD: OpDeskPass123!
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --event-scheduler=ON
+    volumes:
+      - opdesk-db-data:/var/lib/mysql
+      # OpDesk's own schema (users/settings/groups/analytics tables + default admin row).
+      # Runs once on first initialization of an empty data volume.
+      - ./opdesk-src/backend/schema.sql:/docker-entrypoint-initdb.d/01-opdesk-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  opdesk:
+    build:
+      context: ./opdesk-src
+      dockerfile: Dockerfile
+    container_name: opdesk
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    ports:
+      - "8765:8765"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      asterisk:
+        condition: service_started
+
+volumes:
+  opdesk-db-data:
