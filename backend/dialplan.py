@@ -169,6 +169,12 @@ def reload_asterisk_sip(PBX: str | None = None):
     """
     pbx = (PBX or os.getenv('PBX', '') or '').strip().lower()
 
+    # Pure-Asterisk mode: endpoints are managed statically in pjsip.conf, so there is no
+    # fwconsole/retrieve_conf to run. Treat as a successful no-op.
+    if pbx in ('', 'asterisk', 'none', 'pure'):
+        log.info("PBX=Asterisk (pure) — skipping SIP/config reload (manage pjsip.conf directly)")
+        return True
+
     try:
         if pbx == 'issabel':
             log.info("PBX=Issabel detected; running 'retrieve_conf' and 'asterisk -rx \"core reload\"'...")

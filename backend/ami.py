@@ -182,6 +182,9 @@ class AMIExtensionsMonitor:
         self._refresh_event: Optional[asyncio.Event] = None  # Signal for live monitor refresh
         self._event_callbacks: List[Callable[[Dict[str, str]], Awaitable[None]]] = []  # Event callbacks
         
+        # Live inventory discovered from AMI (pure-Asterisk mode): ext -> display name
+        self.endpoint_names: Dict[str, str] = {}
+
         # Queue state
         self.queues:       Dict[str, Dict] = {}   # queue_name -> queue info (members, calls waiting, etc.)
         self.queue_members: Dict[str, Dict] = {}  # member_interface -> member info (queue, status, paused, etc.)
@@ -2604,6 +2607,91 @@ class AMIExtensionsMonitor:
         
         log.info("-" * 70)
         return self.queue_entries.copy()
+
+    # ------------------------------------------------------------------
+    # Inventory discovery (pure-Asterisk mode, no FreePBX DB)
+    # ------------------------------------------------------------------
+    async def load_inventory(self) -> list:
+        """
+        Discover the extension list, names and queues directly from Asterisk over AMI
+        and publish them to the shared `inventory` cache. Used in pure-Asterisk mode where
+        there is no FreePBX MySQL schema to read from.
+
+        Sources:
+          - PJSIPShowEndpoints  -> EndpointList events (ObjectName = endpoint id)
+          - SIPpeers (chan_sip)  -> PeerEntry events    (ObjectName = peer id)   [optional]
+          - QueueSummary         -> queue names
+
+        Returns the sorted list of discovered extensions.
+        """
+        names: Dict[str, str] = {}
+        queues: Dict[str, str] = {}
+
+        if not self.connected:
+            return []
+
+        # --- PJSIP endpoints ---
+        try:
+            resp = await self._send_action_with_events(
+                'PJSIPShowEndpoints', complete_event='EndpointListComplete'
+            )
+            if resp:
+                current_event = None
+                for line in resp.split('\r\n'):
+                    if ':' not in line:
+                        continue
+                    k, v = line.split(':', 1)
+                    k, v = k.strip(), v.strip()
+                    if k == 'Event':
+                        current_event = v
+                        continue
+                    if current_event == 'EndpointList' and k == 'ObjectName' and v:
+                        names.setdefault(v, v)
+        except Exception as e:
+            log.warning("PJSIPShowEndpoints failed: %s", e)
+
+        # --- chan_sip peers (optional; ignored if chan_sip is not loaded) ---
+        try:
+            resp = await self._send_action_with_events(
+                'SIPpeers', complete_event='PeerlistComplete'
+            )
+            if resp and 'Response: Success' in resp:
+                current_event = None
+                for line in resp.split('\r\n'):
+                    if ':' not in line:
+                        continue
+                    k, v = line.split(':', 1)
+                    k, v = k.strip(), v.strip()
+                    if k == 'Event':
+                        current_event = v
+                        continue
+                    if current_event == 'PeerEntry' and k == 'ObjectName' and v:
+                        names.setdefault(v, v)
+        except Exception as e:
+            log.debug("SIPpeers not available: %s", e)
+
+        # --- queues ---
+        try:
+            summary = await self.get_queue_summary()
+            for q in summary.keys():
+                if q:
+                    queues.setdefault(q, q)
+        except Exception as e:
+            log.debug("QueueSummary failed: %s", e)
+
+        self.endpoint_names = names
+        try:
+            import inventory
+            inventory.set_inventory(names, queues)
+        except Exception as e:
+            log.warning("Failed to publish inventory cache: %s", e)
+
+        log.info("📇 Inventory from AMI: %d extension(s), %d queue(s)", len(names), len(queues))
+
+        def _sort_key(e: str):
+            return (0, int(e)) if e.isdigit() else (1, e)
+
+        return sorted(names.keys(), key=_sort_key)
 
     # ------------------------------------------------------------------
     # Monitor entry-points

@@ -32,7 +32,7 @@ from ami import AMIExtensionsMonitor, _format_duration, DIALPLAN_CTX, normalize_
 from db_manager import (
     get_extensions_from_db, get_extension_names_from_db, get_queue_names_from_db, init_settings_table,
     get_setting, set_setting, get_all_settings, authenticate_user, get_call_log_count_from_db, get_call_notifications_from_db, get_call_notification_by_id, update_call_notification_status,
-    get_cdr_by_linkedid,
+    get_cdr_by_linkedid, ensure_admin_user,
     get_all_users, get_user_by_id, get_user_webrtc_credentials, create_user as db_create_user, update_user as db_update_user,
     delete_user as db_delete_user, get_user_agents_and_queues,get_user_group_ids, set_user_groups,get_groups_list, get_group, 
     create_group, update_group, set_group_agents, set_group_queues, set_group_users, delete_group,
@@ -605,6 +605,16 @@ async def lifespan(app: FastAPI):
     # Initialize settings table
     init_settings_table()
 
+    # Pure-Asterisk / lab deployments have no FreePBX installer to set the initial admin
+    # password. Seed (or reset) the admin login from OPDESK_ADMIN_PASSWORD when provided.
+    _admin_pw = os.getenv("OPDESK_ADMIN_PASSWORD", "").strip()
+    if _admin_pw:
+        ensure_admin_user(
+            username=os.getenv("OPDESK_ADMIN_USERNAME", "admin").strip() or "admin",
+            password=_admin_pw,
+            reset=os.getenv("OPDESK_ADMIN_RESET", "").strip().lower() in ("1", "true", "yes"),
+        )
+
 
     # WebRTC default host: prefer the configured public domain (its TLS cert matches); otherwise
     # fall back to the detected local IP. Can be overridden via settings/UI.
@@ -673,8 +683,14 @@ async def lifespan(app: FastAPI):
     if _ami_connected:
         log.info("Connected to AMI")
         
-        # Load extensions
-        extensions = get_extensions_from_db()
+        # Load extensions.
+        # Pure-Asterisk mode: discover endpoints/queues live from AMI and publish them to
+        # the inventory cache. FreePBX mode: load_inventory falls back to the MySQL schema.
+        try:
+            extensions = await monitor.load_inventory()
+        except Exception as e:
+            log.warning(f"AMI inventory discovery failed ({e}); falling back to DB lookup")
+            extensions = get_extensions_from_db()
         if extensions:
             monitor.monitored = set(str(e) for e in extensions)
             log.info(f"Monitoring {len(extensions)} extensions")
@@ -720,8 +736,13 @@ async def lifespan(app: FastAPI):
         bridge = AMIEventBridge(manager, monitor)
         await bridge.start()
 
-        # Start analytics pre-aggregation background task
-        asyncio.create_task(analytics_module.start_aggregation_loop())
+        # Start analytics pre-aggregation background task only when a CDR database is
+        # configured. Pure-Asterisk live-monitoring deployments have no MySQL CDR, so we
+        # skip it to avoid repeated connection errors.
+        if os.getenv("DB_CDR", "").strip():
+            asyncio.create_task(analytics_module.start_aggregation_loop())
+        else:
+            log.info("Analytics disabled (DB_CDR not set) — skipping aggregation loop")
 
         log.info("🎯 Server ready - tracking realtime AMI events")
     else:
@@ -964,7 +985,13 @@ async def webrtc_config(request: Request, current_user: dict = Depends(get_curre
     Return WebRTC softphone config for the current user: PBX WebSocket server URL (from settings),
     user extension and extension_secret (from DB). Used by the React softphone to register with SIP.js.
     """
-    stored = (get_setting("WEBRTC_PBX_SERVER", os.getenv("WEBRTC_PBX_SERVER", "")) or "").strip()
+    # Precedence: env-var first (operator override in compose/.env), then DB setting.
+    # The previous order (DB first) silently trapped users when the auto-derived
+    # value was persisted on a prior boot — they would change .env and nothing
+    # happened. Env wins.
+    env_val = (os.getenv("WEBRTC_PBX_SERVER", "") or "").strip()
+    db_val  = (get_setting("WEBRTC_PBX_SERVER", "") or "").strip()
+    stored  = env_val or db_val
     # When the stored value is empty or still the legacy direct-Asterisk default (port 8089),
     # compute the URL from the request host so it works on any hostname without reconfiguration.
     import re
@@ -1577,6 +1604,11 @@ async def handle_client_message(websocket: WebSocket, message: dict):
         elif action == "sync":
             # Full sync: reload extensions from Asterisk DB only if the set changed (new/removed), then sync status/calls/queues
             if monitor:
+                # Pure-Asterisk mode: refresh the live inventory from AMI first.
+                try:
+                    await monitor.load_inventory()
+                except Exception as e:
+                    log.debug(f"inventory refresh on sync failed: {e}")
                 extensions = get_extensions_from_db()
                 if extensions:
                     new_set = set(str(e) for e in extensions)

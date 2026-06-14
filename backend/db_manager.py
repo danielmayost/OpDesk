@@ -17,7 +17,22 @@ try:
 except ImportError:
     reload_asterisk_sip = None
 
+try:
+    import inventory
+except ImportError:
+    inventory = None
+
 load_dotenv()
+
+
+def _is_pure_asterisk() -> bool:
+    """
+    True when running against a plain Asterisk install (no FreePBX/Issabel MySQL schema).
+    Controlled by the PBX env var: 'Asterisk' / 'none' / 'pure' (or unset) => pure mode.
+    In pure mode the extension/queue inventory comes from AMI (see inventory.py) and the
+    FreePBX-only SIP-table writes (secret/name/webrtc) are skipped instead of erroring.
+    """
+    return (os.getenv('PBX', '') or '').strip().lower() in ('', 'asterisk', 'none', 'pure')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -43,7 +58,15 @@ def get_db_config(password,database):
 
 
 def get_extensions_from_db() -> list:
-    """Get list of extension numbers from the database."""
+    """Get list of extension numbers.
+
+    Pure-Asterisk mode: served from the live AMI inventory cache (inventory.py).
+    FreePBX/Issabel mode: read from the MySQL schema (users / ps_endpoints)."""
+    if _is_pure_asterisk():
+        if inventory is not None:
+            return inventory.get_extensions()
+        return []
+
     config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
     extensions = []
 
@@ -77,7 +100,14 @@ def get_extensions_from_db() -> list:
     return extensions
 
 def get_extension_names_from_db() -> dict:
-    """Get extension names mapping (extension -> name) from the database."""
+    """Get extension names mapping (extension -> name).
+
+    Pure-Asterisk mode: served from the live AMI inventory cache."""
+    if _is_pure_asterisk():
+        if inventory is not None:
+            return inventory.get_extension_names()
+        return {}
+
     config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
     extension_names = {}
 
@@ -121,7 +151,14 @@ def get_extension_names_from_db() -> dict:
     return extension_names
 
 def get_queue_names_from_db() -> dict:
-    """Get queue names mapping (queue -> name) from the database."""
+    """Get queue names mapping (queue -> name).
+
+    Pure-Asterisk mode: served from the live AMI inventory cache."""
+    if _is_pure_asterisk():
+        if inventory is not None:
+            return inventory.get_queue_names()
+        return {}
+
     config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
     queue_names = {}
 
@@ -151,8 +188,37 @@ def get_queue_names_from_db() -> dict:
     return queue_names
 
 
+def _get_pure_asterisk_secret(extension: str) -> Optional[str]:
+    """Pure-Asterisk fallback: read SIP auth secret from a static env-var map.
+
+    The source of truth for SIP credentials in pure-Asterisk mode is `pjsip.conf` on
+    disk. OpDesk does not parse that file (to avoid depending on a host-mounted path
+    inside the container), so instead the operator declares the secrets in the
+    `OpDesk_WEBRTC_SECRETS` env-var as `ext:secret,ext:secret,...`.
+
+    Example:
+        OpDesk_WEBRTC_SECRETS=1003:pass1003,1004:pass1004
+    """
+    raw = (os.getenv('OpDesk_WEBRTC_SECRETS') or '').strip()
+    if not raw:
+        return None
+    target = str(extension).strip()
+    for pair in raw.split(','):
+        pair = pair.strip()
+        if not pair or ':' not in pair:
+            continue
+        ext, secret = pair.split(':', 1)
+        if ext.strip() == target:
+            return secret.strip()
+    return None
+
+
 def get_extension_secret_from_db(extension):
-    """Get extension secret from the database."""
+    """Get extension secret from the database (FreePBX `sip` table) or, in
+    pure-Asterisk mode, from the `OpDesk_WEBRTC_SECRETS` env-var map."""
+    if _is_pure_asterisk():
+        return _get_pure_asterisk_secret(extension)
+
     config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
     secret = None
 
@@ -178,6 +244,9 @@ def get_extension_secret_from_db(extension):
 
 def _upsert_sip_keyword(extension: str, keyword: str, value: str) -> bool:
     """Insert or update a keyword row in the Asterisk sip table for an extension."""
+    if _is_pure_asterisk():
+        # No FreePBX `sip` table in pure-Asterisk mode; endpoints live in pjsip.conf.
+        return False
     config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_NAME', 'asterisk'))
     try:
         conn = mysql.connector.connect(**config)
@@ -212,6 +281,8 @@ def set_extension_username_in_pbx(extension: str, username: str) -> bool:
 
 def set_extension_name_in_pbx(extension: str, name: str) -> bool:
     """Update the display name for an extension in the Asterisk users table."""
+    if _is_pure_asterisk():
+        return False
     config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_NAME', 'asterisk'))
     try:
         conn = mysql.connector.connect(**config)
@@ -272,6 +343,23 @@ def set_extension_webrtc(extension: str, enabled: bool, PBX: str) -> bool:
         return False
     webrtc_val = 'yes' if enabled else 'no'
     is_issabel = (PBX or '').strip().lower() == 'issabel'
+
+    # Pure-Asterisk mode: no FreePBX/Issabel SIP table to toggle. WebRTC endpoints are
+    # configured statically in pjsip.conf, so just record the flag in the OpDesk users table.
+    if _is_pure_asterisk():
+        opdesk_config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))
+        try:
+            conn = mysql.connector.connect(**opdesk_config)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET webrtc = %s WHERE extension = %s", (webrtc_val, ext))
+            ok = cursor.rowcount > 0
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return ok
+        except Error as err:
+            log.warning(f"set_extension_webrtc users ({ext}): {err}")
+            return False
 
     # Enable/disable: OpDesk users.webrtc only
     opdesk_config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))
@@ -1178,6 +1266,60 @@ def authenticate_user(login: str, password: str) -> dict:
 # ---------------------------------------------------------------------------
 # User management (admin): list, create, update, delete, agents/queues
 # ---------------------------------------------------------------------------
+
+def ensure_admin_user(username: str = 'admin', password: Optional[str] = None,
+                      reset: bool = False) -> None:
+    """
+    Ensure an admin user exists with a known password. Used in pure-Asterisk / lab
+    deployments where there is no FreePBX installer to set the initial admin password.
+
+    - If the user is missing, create it as an admin with the given password.
+    - If it exists and (reset is True or it has no password hash), update the password.
+    - Also grants the admin all monitor modes (listen/whisper/barge).
+    No-op when password is empty.
+    """
+    if not password:
+        return
+    config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))
+    try:
+        import bcrypt
+        pw_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        conn = mysql.connector.connect(**config)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, password_hash FROM users WHERE username = %s", (username,))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, name, role) VALUES (%s, %s, 'Admin', 'admin')",
+                (username, pw_hash),
+            )
+            conn.commit()
+            user_id = cursor.lastrowid
+            log.info(f"✅ Created admin user '{username}'")
+        else:
+            user_id = row['id']
+            if reset or not row.get('password_hash'):
+                cursor.execute(
+                    "UPDATE users SET password_hash = %s, role = 'admin', is_active = 1 WHERE id = %s",
+                    (pw_hash, user_id),
+                )
+                conn.commit()
+                log.info(f"✅ Reset password for admin user '{username}'")
+        # Grant all monitor modes to the admin
+        for mode in ('listen', 'whisper', 'barge'):
+            try:
+                cursor.execute(
+                    "INSERT IGNORE INTO user_monitor_modes (user_id, mode) VALUES (%s, %s)",
+                    (user_id, mode),
+                )
+            except Error:
+                pass
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        log.warning(f"⚠️  ensure_admin_user failed: {e}")
+
 
 def get_all_users() -> list:
     """Get all users (id, username, extension, name, role, is_active, monitor_modes). No password_hash."""
