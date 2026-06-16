@@ -28,7 +28,7 @@ services:
       - opdesk-db-data:/var/lib/mysql
       # OpDesk's own schema (users/settings/groups/analytics tables + default admin row).
       # Runs once on first initialization of an empty data volume.
-      - ./opdesk-src/backend/schema.sql:/docker-entrypoint-initdb.d/01-opdesk-schema.sql:ro
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/01-opdesk-schema.sql:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
@@ -37,7 +37,6 @@ services:
 
   opdesk:
     build:
-      context: ./opdesk-src
       dockerfile: Dockerfile
     container_name: opdesk
     restart: unless-stopped
@@ -48,8 +47,6 @@ services:
     depends_on:
       mariadb:
         condition: service_healthy
-      asterisk:
-        condition: service_started
 
 volumes:
   opdesk-db-data:

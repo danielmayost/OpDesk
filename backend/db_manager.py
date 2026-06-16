@@ -977,57 +977,56 @@ def execute_sql_file(sql_file_path: str) -> bool:
         return False
 
 
+def _opdesk_schema_is_initialized() -> bool:
+    """
+    True only when the OpDesk database has the core tables (`users`, `OpDesk_settings`).
+    The `OpDesk` database itself may exist (env var `MARIADB_DATABASE` creates it on
+    first MariaDB start) while being completely empty of tables — that happens when
+    the `docker-entrypoint-initdb.d/*.sql` init scripts were skipped (e.g. reused
+    volume from a previous run). In that case we must re-run schema.sql.
+    """
+    config = get_db_config(os.getenv('DB_PASSWORD'), os.getenv('DB_OpDesk', 'OpDesk'))
+    try:
+        conn = mysql.connector.connect(**config)
+        cursor = conn.cursor()
+        cursor.execute("SHOW TABLES LIKE 'users'")
+        users_ok = cursor.fetchone() is not None
+        cursor.execute("SHOW TABLES LIKE 'OpDesk_settings'")
+        settings_ok = cursor.fetchone() is not None
+        cursor.close()
+        conn.close()
+        return users_ok and settings_ok
+    except Error as e:
+        log.warning(f"⚠️  Could not verify OpDesk schema state: {e}")
+        return False
+
+
 def init_settings_table():
-    """Check if OpDesk database exists, and if not, create it from schema.sql."""
-    # Check if OpDesk database exists
-    if check_database_exists('OpDesk'):
-        log.info("✅ OpDesk database already exists")
-        try:
-            config = get_db_config(os.getenv('DB_PASSWORD'),os.getenv('DB_OpDesk', 'OpDesk'))
-            conn = mysql.connector.connect(**config)
-            cursor = conn.cursor()
-            cursor.execute("SHOW TABLES LIKE 'OpDesk_settings'")
-            if not cursor.fetchone():
-                log.info("📋 Creating OpDesk_settings table...")
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS OpDesk_settings (
-                        setting_key VARCHAR(191) PRIMARY KEY,
-                        setting_value TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                conn.commit()
-                log.info("✅ OpDesk_settings table created")
+    """Make sure the OpDesk database and its core tables exist.
 
-            admin_hash_path = os.path.join(os.path.dirname(__file__), '.admin_init_hash')
-            if os.path.exists(admin_hash_path):
-                with open(admin_hash_path, 'r') as f:
-                    pw_hash = f.read().strip()
-                if pw_hash:
-                    cursor.execute(
-                        "UPDATE users SET password_hash = %s WHERE username = 'admin'",
-                        (pw_hash,),
-                    )
-                    conn.commit()
-                    os.remove(admin_hash_path)
-                    log.info("✅ Admin password applied from installer")
-
-            cursor.close()
-            conn.close()
-        except Error as e:
-            log.warning(f"⚠️  Error checking/creating table: {e}")
+    The `OpDesk` database is normally created by MariaDB itself (MARIADB_DATABASE),
+    and `backend/schema.sql` is mounted into `docker-entrypoint-initdb.d/` to
+    populate the tables on first start. That init script does NOT re-run on a
+    pre-existing data volume, so we also run schema.sql from here whenever the
+    core tables are missing. This makes the app self-heal across volume reuse.
+    """
+    if not check_database_exists('OpDesk'):
+        log.info("📋 OpDesk database not found. Creating from schema.sql...")
+    elif not _opdesk_schema_is_initialized():
+        log.warning("⚠️  OpDesk database exists but core tables are missing — "
+                    "the init scripts in docker-entrypoint-initdb.d/ were skipped "
+                    "(reused data volume?). Running schema.sql to self-heal.")
+    else:
+        log.info("✅ OpDesk database and core tables already exist")
         return True
-    
-    # Database doesn't exist, create it from schema.sql
-    log.info("📋 OpDesk database not found. Creating from schema.sql...")
-    
+
     # Get path to schema.sql file
     schema_path = os.path.join(os.path.dirname(__file__), 'schema.sql')
-    
+
     if not os.path.exists(schema_path):
         log.error(f"❌ Schema file not found: {schema_path}")
         return False
-    
+
     # Execute schema.sql to create database and tables
     if execute_sql_file(schema_path):
         try:
