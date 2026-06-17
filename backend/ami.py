@@ -222,11 +222,6 @@ class AMIExtensionsMonitor:
             resp = await self._read_async()
             if 'Response: Success' in resp:
                 log.info("Connected & authenticated to AMI at %s:%d", self.host, self.port)
-                # Initial queue status sync
-                try:
-                    await self.sync_queue_status()
-                except Exception as e:
-                    log.warning("Failed to sync initial queue status: %s", e)
                 return True
             log.error("Auth failed: %s", resp)
         except Exception as e:
@@ -337,8 +332,8 @@ class AMIExtensionsMonitor:
                 log.error("Send %s failed: %s", action, e)
                 return None
     
-    async def _send_action_with_events(self, action: str, params: Optional[Dict[str,str]] = None, 
-                                        complete_event: str = None, timeout: float = 10.0) -> Optional[str]:
+    async def _send_action_with_events(self, action: str, params: Optional[Dict[str,str]] = None,
+                                        complete_event: str = None, timeout: float = 3.0) -> Optional[str]:
         """
         Send AMI action and read response including follow-up events.
         Uses lock to prevent concurrent reads.
@@ -2460,72 +2455,69 @@ class AMIExtensionsMonitor:
                 'talk_time': queue_stats.get('TalkTime', '0'),
             }
         
-        # Get detailed queue status with members and entries for each queue
-        for queue_name in summary.keys():
-            resp = await self._send_action_with_events('QueueStatus', {'Queue': queue_name}, 'QueueStatusComplete')
-            if resp and 'Response: Success' in resp:
-                lines = resp.split('\r\n')
-                current_item = {}
-                current_event = None
-                
-                for line in lines:
-                    if ':' not in line:
-                        continue
-                    k, v = line.split(':', 1)
-                    k, v = k.strip(), v.strip()
-                    
-                    if k == 'Event':
-                        # Save previous item if complete
-                        if current_event == 'QueueMember' and 'queue' in current_item and 'interface' in current_item:
-                            self._add_queue_member(current_item)
-                        elif current_event == 'QueueEntry' and 'queue' in current_item and 'uniqueid' in current_item:
-                            self._add_queue_entry(current_item)
-                        
-                        current_event = v
-                        current_item = {}
-                        
-                        if v == 'QueueStatusComplete':
-                            break
-                        continue
-                    
-                    # Collect fields for current event
-                    if current_event == 'QueueMember':
-                        if k == 'Queue':
-                            current_item['queue'] = v
-                        elif k == 'Name':
-                            current_item['membername'] = v
-                        elif k == 'Location':
-                            current_item['interface'] = v
-                        elif k == 'Status':
-                            current_item['status'] = v
-                        elif k == 'Paused':
-                            current_item['paused'] = v == '1'
-                        elif k == 'Membership':
-                            # Membership: 'static', 'dynamic', or 'realtime'
-                            # Only 'dynamic' members can be removed via AMI
-                            current_item['membership'] = v.lower()
-                        # Log unknown fields for debugging (first time only)
-                        elif k not in ['Event'] and k.lower() not in current_item:
-                            # Only log if we haven't seen this field before for this member
-                            log.debug(f"QueueMember field: {k} = {v}")
-                    
-                    elif current_event == 'QueueEntry':
-                        if k == 'Queue':
-                            current_item['queue'] = v
-                        elif k == 'Position':
-                            current_item['position'] = int(v) if v.isdigit() else 0
-                        elif k == 'CallerIDNum':
-                            current_item['callerid'] = v
-                        elif k == 'Uniqueid':
-                            current_item['uniqueid'] = v
-                        elif k == 'Wait':
-                            current_item['wait'] = int(v) if v.isdigit() else 0
-                
-                # Handle last item
-                if current_event == 'QueueMember' and 'queue' in current_item and 'interface' in current_item:
-                    self._add_queue_member(current_item)
-                elif current_event == 'QueueEntry' and 'queue' in current_item and 'uniqueid' in current_item:
-                    self._add_queue_entry(current_item)
+        # Get detailed queue status (members + waiting entries) for all queues in one shot.
+        # Asterisk's QueueStatus action without a Queue parameter returns events for every
+        # queue followed by a single QueueStatusComplete, avoiding N serial round-trips.
+        resp = await self._send_action_with_events('QueueStatus', complete_event='QueueStatusComplete')
+        if resp and 'Response: Success' in resp:
+            lines = resp.split('\r\n')
+            current_item = {}
+            current_event = None
+
+            for line in lines:
+                if ':' not in line:
+                    continue
+                k, v = line.split(':', 1)
+                k, v = k.strip(), v.strip()
+
+                if k == 'Event':
+                    # Save previous item if complete
+                    if current_event == 'QueueMember' and 'queue' in current_item and 'interface' in current_item:
+                        self._add_queue_member(current_item)
+                    elif current_event == 'QueueEntry' and 'queue' in current_item and 'uniqueid' in current_item:
+                        self._add_queue_entry(current_item)
+
+                    current_event = v
+                    current_item = {}
+
+                    if v == 'QueueStatusComplete':
+                        break
+                    continue
+
+                # Collect fields for current event
+                if current_event == 'QueueMember':
+                    if k == 'Queue':
+                        current_item['queue'] = v
+                    elif k == 'Name':
+                        current_item['membername'] = v
+                    elif k == 'Location':
+                        current_item['interface'] = v
+                    elif k == 'Status':
+                        current_item['status'] = v
+                    elif k == 'Paused':
+                        current_item['paused'] = v == '1'
+                    elif k == 'Membership':
+                        current_item['membership'] = v.lower()
+                    elif k not in ['Event'] and k.lower() not in current_item:
+                        log.debug(f"QueueMember field: {k} = {v}")
+
+                elif current_event == 'QueueEntry':
+                    if k == 'Queue':
+                        current_item['queue'] = v
+                    elif k == 'Position':
+                        current_item['position'] = int(v) if v.isdigit() else 0
+                    elif k == 'CallerIDNum':
+                        current_item['callerid'] = v
+                    elif k == 'Uniqueid':
+                        current_item['uniqueid'] = v
+                    elif k == 'Wait':
+                        current_item['wait'] = int(v) if v.isdigit() else 0
+
+            # Handle last item
+            if current_event == 'QueueMember' and 'queue' in current_item and 'interface' in current_item:
+                self._add_queue_member(current_item)
+            elif current_event == 'QueueEntry' and 'queue' in current_item and 'uniqueid' in current_item:
+                self._add_queue_entry(current_item)
         
         log.info(f"Synced {len(self.queues)} queues, {len(self.queue_members)} members, {len(self.queue_entries)} waiting callers")
     
