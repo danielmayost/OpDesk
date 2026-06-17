@@ -1224,7 +1224,7 @@ class AMIExtensionsMonitor:
                     ch_name for ch_name in remaining_channels 
                     if ch_name != ch 
                     and ch_name in self.ch2ext 
-                    and not ch_name.startswith('PJSIP/asterisk-')  # Exclude system channels
+                    and not ch_name.startswith(f'{_sip_channel_prefix()}/asterisk-')  # Exclude system channels
                 }
                 if active_channels:
                     is_final_hangup = False
@@ -2893,7 +2893,7 @@ class AMIExtensionsMonitor:
 
         base = ch.rsplit('-', 1)[0]
         resp = await self._send_async('Originate', {
-            'Channel':     f'PJSIP/{supervisor}',
+            'Channel':     f'{_sip_channel_prefix()}/{supervisor}',
             'Application': 'ChanSpy',
             'Data':        f'{base},{options}',
             'CallerID':    f'{label} <{target}>',
@@ -3134,20 +3134,36 @@ class AMIExtensionsMonitor:
 # ---------------------------------------------------------------------------
 # Utility function
 # ---------------------------------------------------------------------------
+def _sip_channel_prefix() -> str:
+    """
+    Return the SIP channel-driver prefix to use when originating calls or
+    referencing an extension by its bare number. Configured via
+    `AMI_CHANNEL_TYPE` in .env — `pjsip` (default) or `chan_sip`.
+    """
+    raw = (os.getenv('AMI_CHANNEL_TYPE', 'pjsip') or 'pjsip').strip().lower()
+    return 'SIP' if raw in ('chan_sip', 'sip', 'chan-sip') else 'PJSIP'
+
+
 def normalize_interface(interface: str) -> str:
     """
-    Normalize interface input - if just a number, prepend PJSIP/
-    
-    Examples:
+    Normalize interface input - if just a number, prepend the configured
+    SIP channel-driver prefix (PJSIP/ or SIP/).
+
+    Examples (with AMI_CHANNEL_TYPE=pjsip):
         '100' -> 'PJSIP/100'
         'PJSIP/100' -> 'PJSIP/100'
         'SIP/100' -> 'SIP/100'
+
+    Examples (with AMI_CHANNEL_TYPE=chan_sip):
+        '100' -> 'SIP/100'
+        'SIP/100' -> 'SIP/100'
+        'PJSIP/100' -> 'PJSIP/100'  (preserved, not rewritten)
     """
     if not interface:
         return interface
     interface = interface.strip()
     if interface.isdigit():
-        return f"PJSIP/{interface}"
+        return f"{_sip_channel_prefix()}/{interface}"
     if '/' in interface:
         return interface
-    return f"PJSIP/{interface}"
+    return f"{_sip_channel_prefix()}/{interface}"
