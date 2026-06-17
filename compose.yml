@@ -13,6 +13,7 @@ services:
     image: mariadb:11
     container_name: opdesk-db
     restart: unless-stopped
+    network_mode: host
     environment:
       MARIADB_ROOT_PASSWORD: OpDeskRoot123!
       # Pre-creates the OpDesk database and grants the OpDesk user on it. The schema
@@ -39,6 +40,7 @@ services:
     build:
       dockerfile: Dockerfile
     container_name: opdesk
+    network_mode: host
     restart: unless-stopped
     env_file:
       - ./.env
