@@ -171,6 +171,11 @@ class AMIExtensionsMonitor:
         self._event_task: Optional[asyncio.Task] = None
         self._read_buffer: str = ""  # Buffer for partial messages
         self._read_lock: asyncio.Lock = asyncio.Lock()  # Prevent concurrent reads
+        # Leftover bytes from _send_action_with_events: live AMI events that arrived in
+        # the same read buffer AFTER the *Complete marker. The event reader picks them
+        # up so they are never lost when sync actions (Status, QueueStatus, etc.) race
+        # with the background event reader on the same socket.
+        self._pending_events_buffer: str = ""
 
         # Live state
         self.extensions:   Dict[str, Dict] = {}   # ext -> last ExtensionStatus response
@@ -357,6 +362,10 @@ class AMIExtensionsMonitor:
         # Auto-detect complete event name if not provided
         if not complete_event:
             complete_event = f"{action}Complete"
+
+        # Anchor on the full message terminator so we can cleanly split the response
+        # from any live events that arrived in the same read buffer after it.
+        complete_marker = f"Event: {complete_event}{AMI_RESPONSE_END}"
         
         async with self._read_lock:
             try:
@@ -381,8 +390,17 @@ class AMIExtensionsMonitor:
                     except asyncio.TimeoutError:
                         # Check if we have the complete event in what we've read so far
                         full_response = ''.join(chunks)
+                        idx = full_response.find(complete_marker)
+                        if idx >= 0:
+                            end_idx = idx + len(complete_marker)
+                            if end_idx < len(full_response):
+                                # Stash live events that came after the *Complete marker
+                                # so the background event reader can dispatch them.
+                                self._pending_events_buffer += full_response[end_idx:]
+                            return full_response[:end_idx]
                         if complete_event in full_response:
-                            break
+                            # Have the event name but not its terminator yet; wait for more.
+                            continue
                         continue
                     
                     if not data:
@@ -391,10 +409,16 @@ class AMIExtensionsMonitor:
                     decoded = data.decode('utf-8', errors='ignore')
                     chunks.append(decoded)
                     
-                    # Check if we have the complete event
+                    # Check if we have the complete event with its terminator
                     full_response = ''.join(chunks)
-                    if complete_event in full_response:
-                        break
+                    idx = full_response.find(complete_marker)
+                    if idx >= 0:
+                        end_idx = idx + len(complete_marker)
+                        if end_idx < len(full_response):
+                            # Stash live events that came after the *Complete marker
+                            # so the background event reader can dispatch them.
+                            self._pending_events_buffer += full_response[end_idx:]
+                        return full_response[:end_idx]
                 
                 return ''.join(chunks)
                 
@@ -413,6 +437,13 @@ class AMIExtensionsMonitor:
             try:
                 # Acquire lock before reading to prevent conflicts with _send_async/_read_async
                 async with self._read_lock:
+                    # Pick up any live events that arrived in the same read buffer as the
+                    # most recent sync action's *Complete marker (Newchannel, Hangup, etc.)
+                    # so they are never lost when sync actions race with this reader.
+                    if self._pending_events_buffer:
+                        buffer += self._pending_events_buffer
+                        self._pending_events_buffer = ""
+                    
                     # Read data with a reasonable timeout
                     try:
                         data = await asyncio.wait_for(self.reader.read(4096), timeout=EVENT_TIMEOUT)
