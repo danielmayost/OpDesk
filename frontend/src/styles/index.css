@@ -890,6 +890,8 @@ body::before {
   flex-direction: column;
   gap: 1px;
   overflow-y: auto;
+  min-height: 0;
+  /* Firefox: keep scrollbar hidden on desktop (tidy rail) */
   scrollbar-width: none;
 }
 .sidebar-nav::-webkit-scrollbar { display: none; }
@@ -1110,7 +1112,26 @@ body::before {
   flex-direction: column;
   gap: 20px;
   width: 100%;
+  /* Reserve space for the scrollbar so content doesn't shift when it
+     appears/disappears; the always-on thumb is a clear affordance that
+     more extensions/queues/etc. live below the fold on small screens. */
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
 }
+
+/* A persistent, slim scrollbar on the main content. Mobile WebKit hides
+   ::-webkit-scrollbar unless actively scrolling, so we also force a thin
+   track to stay visible. */
+.main-content::-webkit-scrollbar { width: 8px; }
+.main-content::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 4px;
+}
+.main-content::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 4px;
+}
+.main-content::-webkit-scrollbar-thumb:hover { background: var(--accent-gold-dim); }
 
 /* Tabs - Modern segmented control */
 .tabs {
@@ -5148,6 +5169,24 @@ select.an-filter-select option:checked {
     background: rgba(0, 0, 0, 0.5);
     z-index: 100;
     animation: an-dropdown-in 0.15s ease;
+  }
+
+  /* Reveal the nav scrollbar inside the mobile drawer — items like
+     Extensions/Calls/Queues/Analytics/Groups/Users can easily exceed the
+     viewport on phones, but a hidden scrollbar left users thinking the
+     rest was missing. */
+  .sidebar-nav {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-accent) transparent;
+  }
+  .sidebar-nav::-webkit-scrollbar {
+    display: block;
+    width: 6px;
+  }
+  .sidebar-nav::-webkit-scrollbar-track { background: transparent; }
+  .sidebar-nav::-webkit-scrollbar-thumb {
+    background: var(--border-accent);
+    border-radius: 3px;
   }
 }
 
