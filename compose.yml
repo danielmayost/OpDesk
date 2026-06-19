@@ -1,13 +1,3 @@
-# Pure-Asterisk lab + OpDesk operator panel (live calls + listen/whisper/barge).
-#
-# OpDesk normally requires FreePBX/Issabel (its MySQL schema for extensions/queues and
-# CDR). This stack runs OpDesk against PLAIN Asterisk:
-#   - extension/queue inventory is discovered live over AMI (no FreePBX schema)
-#   - the only database is OpDesk's own (users/auth/settings)
-#   - call-log/analytics/WebRTC-softphone are intentionally disabled (see opdesk/.env)
-#
-# Access the panel at  http://localhost:8765   (admin / opdesk1234 by default).
-
 services:
   mariadb:
     image: mariadb:11
