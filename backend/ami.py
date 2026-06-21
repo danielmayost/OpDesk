@@ -763,6 +763,36 @@ class AMIExtensionsMonitor:
                 return 'Local'
             return name
         return ''
+
+    def _is_trunk_channel(self, channel: str) -> bool:
+        """
+        Return True for trunk / non-extension channels (e.g. PJSIP/sipgate-...,
+        SIP/trunk-...). Internal endpoints have a numeric identifier after the SIP
+        prefix; trunks/providers have an alphabetic name. Also matches the legacy
+        FreePBX convention of `*/asterisk-*` and any Local/IAX2/etc. channel whose
+        left-side label isn't a digit string.
+        """
+        if not channel:
+            return False
+        prefix = _sip_channel_prefix()  # 'PJSIP' or 'SIP'
+        # Other channel techs (Local/, IAX2/, etc.) without a numeric endpoint
+        # are treated as trunks/system channels for cleanup purposes.
+        if channel.startswith('Local/'):
+            return False
+        # Strip SIP-prefix; everything else is considered a trunk unless the
+        # identifier is purely digits (= internal extension).
+        m = _RE_CHANNEL_TYPE.search(channel)
+        if not m:
+            return False
+        name = m.group(1)
+        # Legacy FreePBX trunk naming
+        if name in ('asterisk',):
+            return True
+        # Numeric identifier -> internal extension, not a trunk
+        if name.isdigit():
+            return False
+        # Anything else (provider name, hostname, 'trunk', etc.) is a trunk.
+        return True
     
     def map_cause_to_status(self, cause, dial_status=None):
         """
@@ -1214,12 +1244,13 @@ class AMIExtensionsMonitor:
             if linkedid in self.linkedid2channels:
                 remaining_channels = self.linkedid2channels[linkedid]
                 # Filter out channels that are no longer in ch2ext (already hung up) and exclude current channel
-                # Also exclude system channels like "asterisk" which are not real call channels
+                # Also exclude trunk/system channels (e.g. "asterisk", provider names) which are not
+                # real call participants.
                 active_channels = {
-                    ch_name for ch_name in remaining_channels 
-                    if ch_name != ch 
-                    and ch_name in self.ch2ext 
-                    and not ch_name.startswith(f'{_sip_channel_prefix()}/asterisk-')  # Exclude system channels
+                    ch_name for ch_name in remaining_channels
+                    if ch_name != ch
+                    and ch_name in self.ch2ext
+                    and not self._is_trunk_channel(ch_name)
                 }
                 if active_channels:
                     is_final_hangup = False
@@ -1261,9 +1292,13 @@ class AMIExtensionsMonitor:
         caller_ext = self.destch2ext.pop(ch, None)
         ch_type = self._get_channel_type(ch)
         
-        # Skip CRM sends for trunk/system channels (e.g., PJSIP/asterisk-*)
-        # These are not actual call participants, just the connection to the external network
-        is_trunk_channel = ch.startswith('PJSIP/asterisk-') or ch.startswith('SIP/asterisk-')
+        # Skip CRM sends for trunk/system channels (e.g., PJSIP/asterisk-*, SIP/<provider>-*)
+        # These are not actual call participants, just the connection to the external network.
+        # A channel is considered a trunk when it does NOT start with the configured SIP prefix
+        # followed by digits (i.e. it's not an internal extension). FreePBX legacy used
+        # PJSIP/asterisk-* and SIP/asterisk-*; pure chan_sip deployments typically name the
+        # trunk (e.g. SIP/sipgate-00000012) so the old hard-coded match misses it.
+        is_trunk_channel = self._is_trunk_channel(ch)
         if is_trunk_channel and is_final_hangup:
             log.debug(f"⏸️ Skipping CRM send for trunk channel {ch} - CRM should be sent from agent/extension perspective")
             is_final_hangup = False  # Prevent CRM send for trunk channels
@@ -2640,10 +2675,10 @@ class AMIExtensionsMonitor:
         and publish them to the shared `inventory` cache. Used in pure-Asterisk mode where
         there is no FreePBX MySQL schema to read from.
 
-        Sources:
-          - PJSIPShowEndpoints  -> EndpointList events (ObjectName = endpoint id)
-          - SIPpeers (chan_sip)  -> PeerEntry events    (ObjectName = peer id)   [optional]
-          - QueueSummary         -> queue names
+        Sources (driven by AMI_CHANNEL_TYPE):
+          - pjsip    -> PJSIPShowEndpoints -> EndpointList events (ObjectName = endpoint id)
+          - chan_sip -> SIPpeers           -> PeerEntry events    (ObjectName = peer id)
+          - QueueSummary                    -> queue names (always)
 
         Returns the sorted list of discovered extensions.
         """
@@ -2653,45 +2688,71 @@ class AMIExtensionsMonitor:
         if not self.connected:
             return []
 
-        # --- PJSIP endpoints ---
-        try:
-            resp = await self._send_action_with_events(
-                'PJSIPShowEndpoints', complete_event='EndpointListComplete'
-            )
-            if resp:
-                current_event = None
-                for line in resp.split('\r\n'):
-                    if ':' not in line:
-                        continue
-                    k, v = line.split(':', 1)
-                    k, v = k.strip(), v.strip()
-                    if k == 'Event':
-                        current_event = v
-                        continue
-                    if current_event == 'EndpointList' and k == 'ObjectName' and v:
-                        names.setdefault(v, v)
-        except Exception as e:
-            log.warning("PJSIPShowEndpoints failed: %s", e)
+        chan_type = (os.getenv('AMI_CHANNEL_TYPE', 'pjsip') or 'pjsip').strip().lower()
+        use_pjsip = chan_type in ('pjsip', 'chan_pjsip', 'chan-pjsip')
+        use_chansip = chan_type in ('chan_sip', 'sip', 'chan-sip')
 
-        # --- chan_sip peers (optional; ignored if chan_sip is not loaded) ---
-        try:
-            resp = await self._send_action_with_events(
-                'SIPpeers', complete_event='PeerlistComplete'
-            )
-            if resp and 'Response: Success' in resp:
-                current_event = None
-                for line in resp.split('\r\n'):
-                    if ':' not in line:
-                        continue
-                    k, v = line.split(':', 1)
-                    k, v = k.strip(), v.strip()
-                    if k == 'Event':
-                        current_event = v
-                        continue
-                    if current_event == 'PeerEntry' and k == 'ObjectName' and v:
-                        names.setdefault(v, v)
-        except Exception as e:
-            log.debug("SIPpeers not available: %s", e)
+        # --- PJSIP endpoints (only when running chan_pjsip) ---
+        if use_pjsip:
+            try:
+                resp = await self._send_action_with_events(
+                    'PJSIPShowEndpoints', complete_event='EndpointListComplete'
+                )
+                if resp:
+                    current_event = None
+                    for line in resp.split('\r\n'):
+                        if ':' not in line:
+                            continue
+                        k, v = line.split(':', 1)
+                        k, v = k.strip(), v.strip()
+                        if k == 'Event':
+                            current_event = v
+                            continue
+                        if current_event == 'EndpointList' and k == 'ObjectName' and v:
+                            names.setdefault(v, v)
+            except Exception as e:
+                log.warning("PJSIPShowEndpoints failed: %s", e)
+        elif not use_chansip:
+            # Unknown channel type — try both as a best-effort fallback.
+            try:
+                resp = await self._send_action_with_events(
+                    'PJSIPShowEndpoints', complete_event='EndpointListComplete'
+                )
+                if resp:
+                    current_event = None
+                    for line in resp.split('\r\n'):
+                        if ':' not in line:
+                            continue
+                        k, v = line.split(':', 1)
+                        k, v = k.strip(), v.strip()
+                        if k == 'Event':
+                            current_event = v
+                            continue
+                        if current_event == 'EndpointList' and k == 'ObjectName' and v:
+                            names.setdefault(v, v)
+            except Exception as e:
+                log.debug("PJSIPShowEndpoints fallback failed: %s", e)
+
+        # --- chan_sip peers (only when running chan_sip) ---
+        if use_chansip or not use_pjsip:
+            try:
+                resp = await self._send_action_with_events(
+                    'SIPpeers', complete_event='PeerlistComplete'
+                )
+                if resp and 'Response: Success' in resp:
+                    current_event = None
+                    for line in resp.split('\r\n'):
+                        if ':' not in line:
+                            continue
+                        k, v = line.split(':', 1)
+                        k, v = k.strip(), v.strip()
+                        if k == 'Event':
+                            current_event = v
+                            continue
+                        if current_event == 'PeerEntry' and k == 'ObjectName' and v:
+                            names.setdefault(v, v)
+            except Exception as e:
+                log.debug("SIPpeers not available: %s", e)
 
         # --- queues ---
         try:

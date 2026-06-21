@@ -111,6 +111,12 @@ def log_startup_summary(monitor: AMIExtensionsMonitor):
 # ---------------------------------------------------------------------------
 # Connection Manager for WebSocket clients
 # ---------------------------------------------------------------------------
+# Per-WS send timeout (seconds). Prevents a single slow/dead client (e.g. a
+# backgrounded mobile tab whose socket buffer is full) from freezing the
+# broadcast loop and starving every other connected client of state updates.
+_WS_SEND_TIMEOUT = 2.0
+
+
 class ConnectionManager:
     """Manages WebSocket connections and broadcasts. Stores per-connection user scope for filtered state."""
     
@@ -262,24 +268,44 @@ class AMIEventBridge:
                 await asyncio.sleep(1)
     
     async def _broadcast_current_state(self):
-        """Broadcast state to each client with their scope filter (role/ext/queue)."""
+        """Broadcast state to each client with their scope filter (role/ext/queue).
+
+        Sends concurrently with a per-client timeout so a single slow/dead
+        WebSocket (e.g. a backgrounded mobile tab) cannot freeze the broadcast
+        loop and stall state updates for everyone else.
+        """
         async with self.manager._lock:
             connections = list(self.manager.active_connections)
             scopes = {ws: self.manager.get_scope(ws) for ws in connections}
-        disconnected = set()
+        if not connections:
+            return
+
+        # Build all payloads up front so each client gets the same snapshot and we
+        # don't hold any locks while doing I/O.
+        payloads = {}
         for connection in connections:
             scope = scopes.get(connection, {})
             allow_ext = None if scope.get("role") == "admin" else (scope.get("allowed_agent_extensions") or [])
             allow_queues = None if scope.get("role") == "admin" else (scope.get("allowed_queue_names") or [])
             state = self.get_current_state(allow_extensions=allow_ext, allow_queues=allow_queues)
+            payloads[connection] = {
+                "type": "state_update",
+                "data": state,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        async def _send_one(ws, msg):
             try:
-                await self.manager.send_personal(connection, {
-                    "type": "state_update",
-                    "data": state,
-                    "timestamp": datetime.now().isoformat()
-                })
+                await asyncio.wait_for(ws.send_text(json.dumps(msg, default=str)), timeout=_WS_SEND_TIMEOUT)
+                return None
             except Exception:
-                disconnected.add(connection)
+                return ws
+
+        results = await asyncio.gather(
+            *(_send_one(ws, payloads[ws]) for ws in connections),
+            return_exceptions=True,
+        )
+        disconnected = {r for r in results if r is not None}
         if disconnected:
             async with self.manager._lock:
                 for ws in disconnected:
@@ -691,9 +717,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f"AMI inventory discovery failed ({e}); falling back to DB lookup")
             extensions = get_extensions_from_db()
+        # If AMI discovery returned nothing (e.g. PJSIPShowEndpoints on a chan_sip box,
+        # or SIPpeers when chan_sip is unloaded), still try the DB so we have something
+        # to monitor instead of silently running with an empty set.
+        if not extensions:
+            db_exts = get_extensions_from_db()
+            if db_exts:
+                extensions = db_exts
+                log.info(f"AMI inventory empty — using {len(db_exts)} extensions from DB")
         if extensions:
             monitor.monitored = set(str(e) for e in extensions)
             log.info(f"Monitoring {len(extensions)} extensions")
+        else:
+            log.warning("No extensions discovered — UI will show no extensions until AMI pushes Endpoint/Peer events")
         
         # Initial sync (BEFORE starting event reader to avoid concurrent reads)
         # This gets the current state of all calls, extensions and queues
