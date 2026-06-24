@@ -37,10 +37,10 @@ from db_manager import (
     delete_user as db_delete_user, get_user_agents_and_queues,get_user_group_ids, set_user_groups,get_groups_list, get_group, 
     create_group, update_group, set_group_agents, set_group_queues, set_group_users, delete_group,
     get_agents_list, get_queues_list, sync_agents_from_extensions, sync_queues_from_list,
-    set_extension_webrtc, get_extensions_with_webrtc_from_users,get_extension_secret_from_db, set_extension_secret_in_pbx, set_extension_username_in_pbx, set_extension_name_in_pbx,
+    set_extension_webrtc, get_extensions_with_webrtc_from_users,get_extension_secret_from_db,
     register_device_token, delete_device_token, get_device_tokens_for_extension
 )
-from dialplan import enable_qos, disable_qos, enable_sip_tls, disable_sip_tls, enable_mobile_wake, disable_mobile_wake, reload_asterisk_sip
+from dialplan import enable_qos, disable_qos, enable_sip_tls, disable_sip_tls, enable_mobile_wake, disable_mobile_wake
 from call_log import call_log as get_call_log, build_call_journey_from_cdr
 import analytics as analytics_module
 import push_service
@@ -710,8 +710,7 @@ async def lifespan(app: FastAPI):
         log.info("Connected to AMI")
         
         # Load extensions.
-        # Pure-Asterisk mode: discover endpoints/queues live from AMI and publish them to
-        # the inventory cache. FreePBX mode: load_inventory falls back to the MySQL schema.
+        # Discover endpoints/queues live from AMI and publish them to the inventory cache.
         try:
             extensions = await monitor.load_inventory()
         except Exception as e:
@@ -1251,16 +1250,6 @@ async def api_create_user(
     if not user_id:
         raise HTTPException(status_code=400, detail="Username or extension already in use")
     set_user_groups(user_id, group_ids=body.group_ids or [])
-    if body.extension:
-        pbx_changed = False
-        if body.password:
-            set_extension_secret_in_pbx(body.extension, body.password)
-            pbx_changed = True
-        if body.name:
-            set_extension_name_in_pbx(body.extension, body.name)
-            pbx_changed = True
-        if pbx_changed:
-            reload_asterisk_sip()
     user = get_user_by_id(user_id)
     agents, queues = get_user_agents_and_queues(user_id)
     group_ids = get_user_group_ids(user_id)
@@ -1294,17 +1283,6 @@ async def api_update_user(
     )
     if body.group_ids is not None:
         set_user_groups(user_id, body.group_ids)
-    ext = body.extension or user.get("extension")
-    pbx_changed = False
-    if ext:
-        if body.password:
-            set_extension_secret_in_pbx(ext, body.password)
-            pbx_changed = True
-        if body.name:
-            set_extension_name_in_pbx(ext, body.name)
-            pbx_changed = True
-    if pbx_changed:
-        reload_asterisk_sip()
     user = get_user_by_id(user_id)
     agents, queues = get_user_agents_and_queues(user_id)
     group_ids = get_user_group_ids(user_id)
@@ -1405,7 +1383,7 @@ async def api_set_extension_webrtc(
     if not allowed:
         raise HTTPException(status_code=403, detail="Not allowed to change WebRTC for this extension")
 
-    if not set_extension_webrtc(extension=ext, enabled=enabled,PBX=os.getenv('PBX')):
+    if not set_extension_webrtc(extension=ext, enabled=enabled):
         raise HTTPException(status_code=404, detail="Extension not found in users")
 
     log.info(f"WebRTC enabled/disabled for extension: {ext} - {enabled}")
@@ -1984,10 +1962,9 @@ async def get_qos_status(current_user: dict = Depends(get_current_user)):
     """Get current QoS configuration status from database."""
     qos_enabled_str = get_setting('QOS_ENABLED', os.getenv('QOS_ENABLED', ''))
     qos_enabled = qos_enabled_str.lower() in ('true', '1', 'yes')
-    
+
     return {
         "enabled": qos_enabled,
-        "pbx": get_setting('PBX', os.getenv('PBX', 'FreePBX'))
     }
 
 

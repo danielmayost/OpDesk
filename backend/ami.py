@@ -768,9 +768,8 @@ class AMIExtensionsMonitor:
         """
         Return True for trunk / non-extension channels (e.g. PJSIP/sipgate-...,
         SIP/trunk-...). Internal endpoints have a numeric identifier after the SIP
-        prefix; trunks/providers have an alphabetic name. Also matches the legacy
-        FreePBX convention of `*/asterisk-*` and any Local/IAX2/etc. channel whose
-        left-side label isn't a digit string.
+        prefix; trunks/providers have an alphabetic name. Also matches any Local/IAX2/etc.
+        channel whose left-side label isn't a digit string.
         """
         if not channel:
             return False
@@ -785,7 +784,7 @@ class AMIExtensionsMonitor:
         if not m:
             return False
         name = m.group(1)
-        # Legacy FreePBX trunk naming
+        # Legacy trunk naming (`*/asterisk-*`) seen in some deployments
         if name in ('asterisk',):
             return True
         # Numeric identifier -> internal extension, not a trunk
@@ -1292,12 +1291,12 @@ class AMIExtensionsMonitor:
         caller_ext = self.destch2ext.pop(ch, None)
         ch_type = self._get_channel_type(ch)
         
-        # Skip CRM sends for trunk/system channels (e.g., PJSIP/asterisk-*, SIP/<provider>-*)
+        # Skip CRM sends for trunk/system channels (e.g., PJSIP/<provider>-*, SIP/<provider>-*)
         # These are not actual call participants, just the connection to the external network.
         # A channel is considered a trunk when it does NOT start with the configured SIP prefix
-        # followed by digits (i.e. it's not an internal extension). FreePBX legacy used
-        # PJSIP/asterisk-* and SIP/asterisk-*; pure chan_sip deployments typically name the
-        # trunk (e.g. SIP/sipgate-00000012) so the old hard-coded match misses it.
+        # followed by digits (i.e. it's not an internal extension). Legacy deployments named
+        # trunks `PJSIP/asterisk-*` and `SIP/asterisk-*`; pure chan_sip deployments typically
+        # name the trunk (e.g. SIP/sipgate-00000012) so the old hard-coded match misses it.
         is_trunk_channel = self._is_trunk_channel(ch)
         if is_trunk_channel and is_final_hangup:
             log.debug(f"⏸️ Skipping CRM send for trunk channel {ch} - CRM should be sent from agent/extension perspective")
@@ -2667,13 +2666,12 @@ class AMIExtensionsMonitor:
         return self.queue_entries.copy()
 
     # ------------------------------------------------------------------
-    # Inventory discovery (pure-Asterisk mode, no FreePBX DB)
+    # Inventory discovery
     # ------------------------------------------------------------------
     async def load_inventory(self) -> list:
         """
         Discover the extension list, names and queues directly from Asterisk over AMI
-        and publish them to the shared `inventory` cache. Used in pure-Asterisk mode where
-        there is no FreePBX MySQL schema to read from.
+        and publish them to the shared `inventory` cache.
 
         Sources (driven by AMI_CHANNEL_TYPE):
           - pjsip    -> PJSIPShowEndpoints -> EndpointList events (ObjectName = endpoint id)

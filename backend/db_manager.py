@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-List all Asterisk/FreePBX users from the database.
+List Asterisk users and extension/queue inventory for the OpDesk panel.
 
 Configuration (via .env):
-    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_OpDesk, DB_CDR
 """
 
 import hashlib
@@ -13,26 +13,11 @@ from typing import Any, Optional, List
 from dotenv import load_dotenv
 
 try:
-    from dialplan import reload_asterisk_sip
-except ImportError:
-    reload_asterisk_sip = None
-
-try:
     import inventory
 except ImportError:
     inventory = None
 
 load_dotenv()
-
-
-def _is_pure_asterisk() -> bool:
-    """
-    True when running against a plain Asterisk install (no FreePBX/Issabel MySQL schema).
-    Controlled by the PBX env var: 'Asterisk' / 'none' / 'pure' (or unset) => pure mode.
-    In pure mode the extension/queue inventory comes from AMI (see inventory.py) and the
-    FreePBX-only SIP-table writes (secret/name/webrtc) are skipped instead of erroring.
-    """
-    return (os.getenv('PBX', '') or '').strip().lower() in ('', 'asterisk', 'none', 'pure')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -58,142 +43,32 @@ def get_db_config(password,database):
 
 
 def get_extensions_from_db() -> list:
-    """Get list of extension numbers.
+    """Get list of extension numbers from the live AMI inventory cache."""
+    if inventory is not None:
+        return inventory.get_extensions()
+    return []
 
-    Pure-Asterisk mode: served from the live AMI inventory cache (inventory.py).
-    FreePBX/Issabel mode: read from the MySQL schema (users / ps_endpoints)."""
-    if _is_pure_asterisk():
-        if inventory is not None:
-            return inventory.get_extensions()
-        return []
-
-    config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
-    extensions = []
-
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor(dictionary=True)
-
-        # Try FreePBX users table first
-        try:
-            cursor.execute("SELECT extension FROM users ORDER BY extension")
-            users = cursor.fetchall()
-            extensions = [str(u['extension']) for u in users if u['extension']]
-        except Error:
-            pass
-
-        # If no extensions found, try PJSIP endpoints
-        if not extensions:
-            try:
-                cursor.execute("SELECT id FROM ps_endpoints WHERE id REGEXP '^[0-9]+$' ORDER BY CAST(id AS UNSIGNED)")
-                endpoints = cursor.fetchall()
-                extensions = [str(e['id']) for e in endpoints if e['id']]
-            except Error:
-                pass
-
-        cursor.close()
-        conn.close()
-
-    except Error as e:
-        log.warning(f"⚠️  Database error getting extensions: {e}")
-
-    return extensions
 
 def get_extension_names_from_db() -> dict:
-    """Get extension names mapping (extension -> name).
+    """Get extension names mapping (extension -> name) from the live AMI inventory cache."""
+    if inventory is not None:
+        return inventory.get_extension_names()
+    return {}
 
-    Pure-Asterisk mode: served from the live AMI inventory cache."""
-    if _is_pure_asterisk():
-        if inventory is not None:
-            return inventory.get_extension_names()
-        return {}
-
-    config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
-    extension_names = {}
-
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor(dictionary=True)
-
-        # Try FreePBX users table first (name field)
-        try:
-            cursor.execute("SELECT extension, name FROM users WHERE extension IS NOT NULL ORDER BY extension")
-            users = cursor.fetchall()
-            for u in users:
-                if u['extension']:
-                    ext = str(u['extension'])
-                    name = u.get('name', '') or ''
-                    if name:
-                        extension_names[ext] = name
-        except Error as e:
-            log.debug(f"Could not get names from users table: {e}")
-
-        # If no names found, try PJSIP endpoints (description field)
-        if not extension_names:
-            try:
-                cursor.execute("SELECT id, description FROM ps_endpoints WHERE id REGEXP '^[0-9]+$' ORDER BY CAST(id AS UNSIGNED)")
-                endpoints = cursor.fetchall()
-                for e in endpoints:
-                    if e['id']:
-                        ext = str(e['id'])
-                        name = e.get('description', '') or ''
-                        if name:
-                            extension_names[ext] = name
-            except Error as e:
-                log.debug(f"Could not get names from ps_endpoints table: {e}")
-
-        cursor.close()
-        conn.close()
-
-    except Error as e:
-        log.warning(f"⚠️  Database error getting extension names: {e}")
-
-    return extension_names
 
 def get_queue_names_from_db() -> dict:
-    """Get queue names mapping (queue -> name).
-
-    Pure-Asterisk mode: served from the live AMI inventory cache."""
-    if _is_pure_asterisk():
-        if inventory is not None:
-            return inventory.get_queue_names()
-        return {}
-
-    config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
-    queue_names = {}
-
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor(dictionary=True)
-
-        # Try FreePBX users table first (name field)
-        try:
-            cursor.execute("SELECT extension, descr FROM queues_config WHERE extension IS NOT NULL ORDER BY extension")
-            users = cursor.fetchall()
-            for u in users:
-                if u['extension']:
-                    ext = str(u['extension'])
-                    name = u.get('descr', '') or ''
-                    if name:
-                        queue_names[ext] = name
-        except Error as e:
-            log.debug(f"Could not get names from users table: {e}")
-
-        cursor.close()
-        conn.close()
-
-    except Error as e:
-        log.warning(f"⚠️  Database error getting extension names: {e}")
-
-    return queue_names
+    """Get queue names mapping (queue -> name) from the live AMI inventory cache."""
+    if inventory is not None:
+        return inventory.get_queue_names()
+    return {}
 
 
 def _get_pure_asterisk_secret(extension: str) -> Optional[str]:
-    """Pure-Asterisk fallback: read SIP auth secret from a static env-var map.
+    """Read SIP auth secret from the `OpDesk_WEBRTC_SECRETS` env-var map.
 
-    The source of truth for SIP credentials in pure-Asterisk mode is `pjsip.conf` on
-    disk. OpDesk does not parse that file (to avoid depending on a host-mounted path
-    inside the container), so instead the operator declares the secrets in the
+    The source of truth for SIP credentials is `pjsip.conf` on disk. OpDesk does
+    not parse that file (to avoid depending on a host-mounted path inside the
+    container), so instead the operator declares the secrets in the
     `OpDesk_WEBRTC_SECRETS` env-var as `ext:secret,ext:secret,...`.
 
     Example:
@@ -214,90 +89,8 @@ def _get_pure_asterisk_secret(extension: str) -> Optional[str]:
 
 
 def get_extension_secret_from_db(extension):
-    """Get extension secret from the database (FreePBX `sip` table) or, in
-    pure-Asterisk mode, from the `OpDesk_WEBRTC_SECRETS` env-var map."""
-    if _is_pure_asterisk():
-        return _get_pure_asterisk_secret(extension)
-
-    config = get_db_config(os.getenv('DB_PASSWORD', ''),os.getenv('DB_NAME', 'asterisk'))
-    secret = None
-
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor(dictionary=True)
-
-        try:
-            cursor.execute("SELECT data FROM sip WHERE id = %s and keyword = 'secret'", (extension,))
-            rows = cursor.fetchall()
-            secret = rows[0]['data'] if rows else None
-        except Error as e:
-            log.debug(f"Could not get extension secret from database: {e}")
-
-        cursor.close()
-        conn.close()
-
-    except Error as e:
-        log.warning(f"⚠️  Database error getting extension secret: {e}")
-
-    return secret
-
-
-def _upsert_sip_keyword(extension: str, keyword: str, value: str) -> bool:
-    """Insert or update a keyword row in the Asterisk sip table for an extension."""
-    if _is_pure_asterisk():
-        # No FreePBX `sip` table in pure-Asterisk mode; endpoints live in pjsip.conf.
-        return False
-    config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_NAME', 'asterisk'))
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE sip SET data = %s WHERE id = %s AND keyword = %s",
-            (value, extension, keyword),
-        )
-        if cursor.rowcount == 0:
-            cursor.execute(
-                "INSERT INTO sip (id, keyword, data) VALUES (%s, %s, %s)",
-                (extension, keyword, value),
-            )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-    except Error as e:
-        log.warning(f"⚠️  Database error _upsert_sip_keyword ({keyword}): {e}")
-        return False
-
-
-def set_extension_secret_in_pbx(extension: str, secret: str) -> bool:
-    """Update the SIP secret for an extension in the Asterisk DB."""
-    return _upsert_sip_keyword(extension, 'secret', secret)
-
-
-def set_extension_username_in_pbx(extension: str, username: str) -> bool:
-    """Update the SIP username for an extension in the Asterisk DB."""
-    return _upsert_sip_keyword(extension, 'username', username)
-
-
-def set_extension_name_in_pbx(extension: str, name: str) -> bool:
-    """Update the display name for an extension in the Asterisk users table."""
-    if _is_pure_asterisk():
-        return False
-    config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_NAME', 'asterisk'))
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET name = %s WHERE extension = %s",
-            (name, extension),
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-    except Error as e:
-        log.warning(f"⚠️  Database error set_extension_name_in_pbx: {e}")
-        return False
+    """Get extension secret from the `OpDesk_WEBRTC_SECRETS` env-var map."""
+    return _get_pure_asterisk_secret(extension)
 
 
 def get_extensions_with_webrtc_from_users() -> list:
@@ -331,136 +124,34 @@ def get_extensions_with_webrtc_from_users() -> list:
     return out
 
 
-def set_extension_webrtc(extension: str, enabled: bool, PBX: str) -> bool:
+def set_extension_webrtc(extension: str, enabled: bool) -> bool:
     """
-    Single place for enable/disable and SIP options.
-    - FreePBX: rtcp_mux, avpf, icesupport, media_encryption + certman_mapping.
-    - Issabel: allow, dtls_cert_file, dtls_private_key, dtls_verify, ice_support, media_encryption, use_avpf, rtcp_mux.
-    Updates OpDesk users.webrtc and Asterisk sip accordingly. Only extensions from users (same as list) can be set.
+    Toggle WebRTC for an extension.
+
+    WebRTC endpoints are configured statically in pjsip.conf, so this only
+    records the `webrtc` flag in the OpDesk users table. Returns True if a row
+    was updated, False otherwise (e.g. extension not in users).
     """
     ext = str(extension).strip()
     if not ext:
         return False
     webrtc_val = 'yes' if enabled else 'no'
-    is_issabel = (PBX or '').strip().lower() == 'issabel'
 
-    # Pure-Asterisk mode: no FreePBX/Issabel SIP table to toggle. WebRTC endpoints are
-    # configured statically in pjsip.conf, so just record the flag in the OpDesk users table.
-    if _is_pure_asterisk():
-        opdesk_config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))
-        try:
-            conn = mysql.connector.connect(**opdesk_config)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET webrtc = %s WHERE extension = %s", (webrtc_val, ext))
-            ok = cursor.rowcount > 0
-            conn.commit()
-            cursor.close()
-            conn.close()
-            return ok
-        except Error as err:
-            log.warning(f"set_extension_webrtc users ({ext}): {err}")
-            return False
-
-    # Enable/disable: OpDesk users.webrtc only
     opdesk_config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))
     try:
         conn = mysql.connector.connect(**opdesk_config)
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET webrtc = %s WHERE extension = %s", (webrtc_val, ext))
-        if cursor.rowcount == 0:
-            cursor.close()
-            conn.close()
-            return False  # Extension not in users (same as list; no duplicate path)
+        ok = cursor.rowcount > 0
         conn.commit()
         cursor.close()
         conn.close()
+        if ok:
+            log.info(f"Updated WebRTC for extension {ext}: users.webrtc={webrtc_val}")
+        return ok
     except Error as err:
         log.warning(f"set_extension_webrtc users ({ext}): {err}")
         return False
-
-    config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_NAME', 'asterisk'))
-    try:
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor()
-        updated = 0
-
-        if is_issabel:
-            # Issabel: allow, dtls_cert_file, dtls_private_key, dtls_verify, ice_support, media_encryption, use_avpf, rtcp_mux
-            if enabled:
-                sip_pairs = [
-                    ('allow', 'ulaw,alaw,g722,gsm,vp9,vp8,h264,opus'),
-                    ('dtls_cert_file', '/etc/asterisk/keys/asterisk.pem'),
-                    ('dtls_private_key', '/etc/asterisk/keys/asterisk.pem'),
-                    ('dtls_verify', 'fingerprint'),
-                    ('ice_support', 'yes'),
-                    ('media_encryption', 'dtls'),
-                    ('use_avpf', 'yes'),
-                    ('rtcp_mux', 'yes'),
-                    ('transport', 'transport-wss')
-                ]
-            else:
-                sip_pairs = [
-                    ('allow', ''),
-                    ('dtls_cert_file', ''),
-                    ('dtls_private_key', ''),
-                    ('dtls_verify', 'no'),
-                    ('ice_support', 'no'),
-                    ('media_encryption', 'no'),
-                    ('use_avpf', 'no'),
-                    ('rtcp_mux', 'no'),
-                    ('transport', 'transport-udp')
-                ]
-            for keyword, value in sip_pairs:
-                cursor.execute(
-                    "UPDATE sip SET data = %s WHERE id = %s AND keyword = %s",
-                    (value, ext, keyword),
-                )
-                if cursor.rowcount == 0:
-                    cursor.execute(
-                        "INSERT INTO sip (id, keyword, data) VALUES (%s, %s, %s)",
-                        (ext, keyword, value),
-                    )
-                updated += cursor.rowcount
-            if updated:
-                log.info(f"Updated WebRTC for extension {ext} (Issabel): users.webrtc={webrtc_val}")
-        else:
-            # FreePBX: rtcp_mux, avpf, icesupport, media_encryption + certman_mapping
-            if enabled:
-                r = a = i = 'yes'
-                e = 'dtls'
-            else:
-                r = a = i = 'no'
-                e = 'no'
-            for keyword, value in [
-                ('rtcp_mux', r),
-                ('avpf', a),
-                ('icesupport', i),
-                ('media_encryption', e),
-            ]:
-                cursor.execute(
-                    "UPDATE sip SET data = %s WHERE id = %s AND keyword = %s",
-                    (value, ext, keyword),
-                )
-                updated += cursor.rowcount
-            if enabled:
-                cursor.execute(
-                    "REPLACE INTO certman_mapping (id, cid, verify, setup, rekey, auto_generate_cert) VALUES (%s, 2, 'fingerprint', 'actpass', 0, 0)",
-                    (ext,),
-                )
-            else:
-                cursor.execute("DELETE FROM certman_mapping WHERE id = %s", (ext,))
-            if updated:
-                log.info(f"Updated WebRTC for extension {ext}: users.webrtc={webrtc_val}, rtcp_mux={r}, avpf={a}, icesupport={i}, media_encryption={e}")
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-        if updated and reload_asterisk_sip:
-            reload_asterisk_sip(PBX)
-        return True
-    except Error as err:
-        log.warning(f"set_extension_webrtc sip/certman ({ext}): {err}")
-        return True  # users.webrtc was set
 
 def get_cdr_by_linkedid(linkedid):
     """
@@ -1936,7 +1627,7 @@ def get_queues_list() -> list:
 
 
 def sync_agents_from_extensions(extension_list: list, name_map: dict) -> None:
-    """Ensure OpDesk agents table has entries for given extensions (from Asterisk/FreePBX)."""
+    """Ensure OpDesk agents table has entries for given extensions (from Asterisk AMI inventory)."""
     if not extension_list:
         return
     config = get_db_config(os.getenv('DB_PASSWORD', ''), os.getenv('DB_OpDesk', 'OpDesk'))

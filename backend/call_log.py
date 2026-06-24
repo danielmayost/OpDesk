@@ -185,7 +185,7 @@ def build_call_journey_from_cdr(cdr_rows: list) -> list:
     journey = []
     def get_answer_time(row):
         """
-        Calculate answer time from FreePBX CDR row
+        Calculate answer time from an Asterisk CDR row.
         """
         if row["billsec"] and row["billsec"] > 0:
             return row["calldate"] + timedelta(

@@ -184,8 +184,9 @@ CREATE TABLE IF NOT EXISTS user_groups (
 
 -- Per-queue SLA threshold configuration.
 -- If a queue has no row here, the backend falls back to OpDesk_settings 'SLA_DEFAULT_SECS'.
--- FIX: FOREIGN KEY omitted intentionally — queues table is populated lazily from FreePBX;
---      a FK would block saving SLA settings before the queue extension appears in OpDesk.queues.
+-- FIX: FOREIGN KEY omitted intentionally — queues table is populated lazily from the
+--      AMI inventory as queues are discovered; a FK would block saving SLA settings
+--      before the queue extension appears in OpDesk.queues.
 CREATE TABLE IF NOT EXISTS analytics_sla_settings (
     queue_extension  VARCHAR(20) PRIMARY KEY,
     threshold_secs   SMALLINT UNSIGNED NOT NULL DEFAULT 20,

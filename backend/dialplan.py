@@ -18,38 +18,40 @@ log = logging.getLogger(__name__)
 EXTENSIONS_CUSTOM_CONF = "/etc/asterisk/extensions_custom.conf"
 EXTENSIONS_OPDESK_CONF = "/etc/asterisk/extensions_opdesk.conf"
 EXTENSIONS_MOBILE_WAKE_CONF = "/etc/asterisk/extensions_mobile_wake.conf"
-# Included INSIDE pjsip.transports.conf BEFORE the auto-generated [0.0.0.0-tls] section.
-# PJSIP uses first-wins for duplicate section names, so this file's definition wins
-# over the auto-generated one.  pjsip.transports_custom_post.conf is included AFTER
-# and therefore loses — do NOT use it for transport overrides.
-PJSIP_TRANSPORTS_CUSTOM = "/etc/asterisk/pjsip.transports_custom.conf"
 
 
 def write_qos_conf():
     """
     Write the QoS dialplan sections to a dedicated extensions_opdesk.conf
     and ensure it is included from extensions_custom.conf.
+
+    The hangup handler is pushed on every call that enters the configured
+    internal context (`AMI_CONTEXT`, default `from-internal`) — the same context
+    every incoming / internal dial lands in, regardless of how the PBX is set up.
     """
     log.info(f"Writing QoS dialplan to {EXTENSIONS_OPDESK_CONF}")
 
-    custom_content = """[from-internal-custom]
+    internal_ctx = os.getenv("AMI_CONTEXT", "from-internal").strip() or "from-internal"
+
+    custom_content = f"""; OpDesk QoS dialplan — auto-generated. Do not edit manually.
+; Pushed via the hangup handler when any call enters the configured internal context
+; (AMI_CONTEXT = {internal_ctx}). The handler samples RTPAUDIOQOS and stores it on
+; the CDR userfield so analytics can read it after the call.
+
+[{internal_ctx}]
 exten => _.,1,Set(CHANNEL(hangup_handler_push)=qos-handler,s,1)
 
-[from-pstn-custom]
-exten => _.,1,Set(CHANNEL(hangup_handler_push)=qos-handler,s,1)
-
-; 2. The Logic remains the same, but now it's guaranteed to run
 [qos-handler]
 exten => s,1,NoOp(-- QoS Handler Start --)
- same => n,Set(QOS_SRC=${IF($["${RTPAUDIOQOSBRIDGED}"!=""]?${RTPAUDIOQOSBRIDGED}:${RTPAUDIOQOS})})
- same => n,GotoIf($["${QOS_SRC}" != ""]?save)
- same => n,Set(QOS_SRC=${DB(qos/${CHANNEL(linkedid)}/data)})
+ same => n,Set(QOS_SRC=${{IF($["${{RTPAUDIOQOSBRIDGED}}"!=""]?${{RTPAUDIOQOSBRIDGED}}:${{RTPAUDIOQOS}})}})
+ same => n,GotoIf($["${{QOS_SRC}}" != ""]?save)
+ same => n,Set(QOS_SRC=${{DB(qos/${{CHANNEL(linkedid)}}/data)}})
 
- same => n(save),GotoIf($["${QOS_SRC}" = ""]?end)
- same => n,Set(QOS_CALLER=${IF($["${DB(qos/${CHANNEL(linkedid)}/caller)}"!=""]?${DB(qos/${CHANNEL(linkedid)}/caller)}:${CALLERID(num)})})
- same => n,Set(CDR(userfield)=QoS:${QOS_SRC},Caller:${QOS_CALLER})
- same => n,NoOp(Saved QoS to CDR: ${CDR(userfield)})
- same => n,DBdeltree(qos/${CHANNEL(linkedid)})
+ same => n(save),GotoIf($["${{QOS_SRC}}" = ""]?end)
+ same => n,Set(QOS_CALLER=${{IF($["${{DB(qos/${{CHANNEL(linkedid)}}/caller)}}"!=""]?${{DB(qos/${{CHANNEL(linkedid)}}/caller)}}:${{CALLERID(num)}})}})
+ same => n,Set(CDR(userfield)=QoS:${{QOS_SRC}},Caller:${{QOS_CALLER}})
+ same => n,NoOp(Saved QoS to CDR: ${{CDR(userfield)}})
+ same => n,DBdeltree(qos/${{CHANNEL(linkedid)}})
  same => n(end),NoOp(QoS Handler Finished)
  same => n,Return()
 """
@@ -161,88 +163,42 @@ def reload_asterisk_dialplan():
         return False
 
 
-def reload_asterisk_sip(PBX: str | None = None):
+def reload_asterisk_sip():
     """
-    Reload Asterisk SIP / configuration based on PBX type.
-    - Issabel: run '/var/lib/asterisk/bin/retrieve_conf && asterisk -rx \"core reload\"'.
-    - FreePBX/other: keep existing 'fwconsole reload' logic.
+    No-op for pure-Asterisk deployments.
+
+    Endpoints are managed statically in `pjsip.conf`, so there is no
+    fwconsole/retrieve_conf to run. Kept as a stable entry point for callers
+    that still want to reload after a config write; returns True.
     """
-    pbx = (PBX or os.getenv('PBX', '') or '').strip().lower()
-
-    # Pure-Asterisk mode: endpoints are managed statically in pjsip.conf, so there is no
-    # fwconsole/retrieve_conf to run. Treat as a successful no-op.
-    if pbx in ('', 'asterisk', 'none', 'pure'):
-        log.info("PBX=Asterisk (pure) — skipping SIP/config reload (manage pjsip.conf directly)")
-        return True
-
-    try:
-        if pbx == 'issabel':
-            log.info("PBX=Issabel detected; running 'retrieve_conf' and 'asterisk -rx \"core reload\"'...")
-            cmd = '/var/lib/asterisk/bin/retrieve_conf && asterisk -rx "core reload"'
-            result = subprocess.run(
-                ['sudo', 'bash', '-c', cmd],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        else:
-            log.info("Running 'fwconsole reload' to apply SIP/WebRTC changes...")
-            result = subprocess.run(
-                ['sudo', 'fwconsole', 'reload'],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-
-        if result.returncode == 0:
-            log.info("Successfully reloaded Asterisk SIP / config")
-            return True
-
-        stderr = (result.stderr or '').strip()
-        stdout = (result.stdout or '').strip()
-        msg = stderr or stdout or 'no output'
-        log.warning(f"SIP/config reload command failed (PBX={pbx or 'unknown'}): {msg}")
-        return False
-
-    except subprocess.TimeoutExpired:
-        log.warning(f"Timeout while reloading SIP/config (PBX={pbx or 'unknown'})")
-        return False
-    except FileNotFoundError as e:
-        log.warning(f"Reload command not found (PBX={pbx or 'unknown'}): {e}")
-        return False
-    except Exception as e:
-        log.warning(f"Error reloading SIP/config (PBX={pbx or 'unknown'}): {e}")
-        return False
+    log.info("PBX=Asterisk (pure) — skipping SIP/config reload (manage pjsip.conf directly)")
+    return True
 
 
 def write_mobile_wake_conf(backend_port: int = None, wait_seconds: int = None) -> bool:
     """
-    Install an automatic "wake before dial" hook in [from-internal-custom].
+    Install an automatic "wake before dial" hook as a standalone context
+    `[opdesk-mobile-wake]`.
 
-    Why here and not a FreePBX predial hook: when a mobile app is killed/backgrounded
-    its SIP registration expires, so PJSIP_DIAL_CONTACTS() returns empty. FreePBX's
-    macro-dial-one resolves contacts (priority ~30) and immediately bails to "nodial"
-    with DIALSTATUS=CHANUNAVAIL *before* it ever reaches the predial hook (godial,
-    priority ~53). The phone is therefore never dialled and no DialBegin event fires —
-    so the AMI-driven push never gets a chance. The wake MUST happen before contact
-    resolution.
+    The hook is designed to be called via `Gosub(opdesk-mobile-wake,s,1)` from
+    the operator's internal context (`AMI_CONTEXT`), e.g.:
 
-    [from-internal-custom] is the right place: FreePBX includes it *first* in
-    [from-internal], ahead of the generated routing, and it is re-entered by the
-    Local/<ext>@from-internal channels that ring groups, queues and follow-me use — so
-    a single hook covers internal calls and most inbound paths automatically, with no
-    per-extension configuration.
+        ; in AMI_CONTEXT (the operator's dialplan)
+        exten => _XXX,1,Gosub(opdesk-mobile-wake,s,1)
+         same =>  n,Dial(PJSIP/${EXTEN},60)
 
-    For each call the hook:
-      1. Falls straight through for anything that is not a real local extension
-         (feature codes, outbound numbers) — Goto(from-internal-additional,...).
-      2. Falls straight through (no wake, zero added latency) if the extension already
-         has a registered contact — the normal ring handles it.
-      3. Otherwise CURLs the backend wake endpoint. The endpoint returns "1" only when
-         the extension has a registered mobile token; only then do we Wait() for the
-         app to come up. Then it hands the call back to the full FreePBX stack via
-         Goto(from-internal-additional,${EXTEN},1) — preserving voicemail, recording,
-         CID, follow-me, etc.
+    Pure-Asterisk mode (no FreePBX context graph):
+      * We do NOT shadow the existing `Dial()` for the pattern — the operator
+        keeps full control over their dialplan.
+      * We do NOT use `DB(AMPUSER/${EXTEN}/device)` — that AstDB key only exists
+        on FreePBX/Issabel deployments. We rely entirely on `PJSIP_DIAL_CONTACTS()`
+        to detect an already-registered mobile SIP contact; if present, the hook
+        falls through immediately (no wake, zero added latency).
+      * Otherwise CURLs the backend wake endpoint. The endpoint returns "1"
+        only when the extension has a registered mobile push token; only then
+        do we `Wait()` for the app to come up.
+      * `Return()` hands control back to the caller's same priority+1 so the
+        operator's `Dial()` (and the AMI `DialBegin` event) still fire.
     """
     if backend_port is None:
         backend_port = int(os.getenv("PORT", "8765"))
@@ -251,32 +207,26 @@ def write_mobile_wake_conf(backend_port: int = None, wait_seconds: int = None) -
 
     log.info(f"Writing mobile wake dialplan to {EXTENSIONS_MOBILE_WAKE_CONF}")
 
-    # The wake/continue body is identical for 3- and 4-digit extensions; emit it once
-    # per pattern. ${EXTEN:0:0} trick is avoided — we just duplicate the few lines.
-    def _hook_lines(pattern: str) -> str:
-        return f"""exten => {pattern},1,NoOp(OpDesk mobile wake check for ${{EXTEN}})
- same => n,ExecIf($[${{DIALPLAN_EXISTS(qos-handler,s,1)}}]?Set(CHANNEL(hangup_handler_push)=qos-handler,s,1))
- same => n,GotoIf($["${{DB(AMPUSER/${{EXTEN}}/device)}}"=""]?passthru)
- same => n,GotoIf($["${{PJSIP_DIAL_CONTACTS(${{EXTEN}})}}"!=""]?passthru)
+    content = f"""; OpDesk mobile wake dialplan — auto-generated. Do not edit manually.
+;
+; Pure-Asterisk mode: this is a standalone context callable via
+;   Gosub(opdesk-mobile-wake,s,1) from the operator's AMI_CONTEXT.
+; See backend/dialplan.write_mobile_wake_conf docstring for usage.
+;
+; Wakes a killed/backgrounded mobile softphone BEFORE the operator's
+; Dial() resolves its SIP contact, so the app has time to re-register
+; and actually ring. Tunable: MOBILE_WAKE_WAIT (seconds to wait after
+; the push) in the backend .env.
+
+[opdesk-mobile-wake]
+exten => s,1,NoOp(OpDesk mobile wake for ${{EXTEN}})
+ same => n,GotoIf($["${{PJSIP_DIAL_CONTACTS(${{EXTEN}})}}"!=""]?return)
  same => n,Set(CURLOPT(conntimeout)=2)
  same => n,Set(CURLOPT(httptimeout)=3)
  same => n,Set(OPDESKWAKE=${{CURL(http://127.0.0.1:{backend_port}/api/internal/mobile-wake/${{EXTEN}}?caller=${{URIENCODE(${{CALLERID(num)}})}})}})
  same => n,ExecIf($["${{OPDESKWAKE}}"="1"]?Wait({wait_seconds}))
- same => n(passthru),Goto(from-internal-additional,${{EXTEN}},1)
+ same => n(return),Return()
 """
-
-    content = f"""; OpDesk mobile wake dialplan — auto-generated. Do not edit manually.
-;
-; Wakes a killed/backgrounded mobile softphone BEFORE FreePBX tries to resolve its SIP
-; contact, so the app has time to re-register and actually ring. Runs automatically for
-; every internal call and for ring-group/queue/follow-me legs (which re-enter
-; from-internal via Local channels). No per-extension configuration required.
-;
-; Tunable: MOBILE_WAKE_WAIT (seconds to wait after the push) in the backend .env.
-;
-[from-internal-custom]
-{_hook_lines("_XXX")}
-{_hook_lines("_XXXX")}"""
     try:
         import tempfile
 
@@ -295,7 +245,9 @@ def write_mobile_wake_conf(backend_port: int = None, wait_seconds: int = None) -
             log.error(f"Failed to write {EXTENSIONS_MOBILE_WAKE_CONF}: {result.stderr}")
             return False
 
-        # Ensure extensions_custom.conf includes the new file
+        # Ensure extensions_custom.conf includes the new file (so the operator's
+        # AMI_CONTEXT — which typically includes extensions_custom.conf — can
+        # Gosub into it).
         include_line = f"#include {os.path.basename(EXTENSIONS_MOBILE_WAKE_CONF)}"
         existing = ""
         if os.path.exists(EXTENSIONS_CUSTOM_CONF):
@@ -449,24 +401,19 @@ _TLS_MARKER_END   = "; --- OpDesk SIP TLS END ---"
 
 def _detect_tls_mode():
     """
-    Return ('freepbx', config_file) or ('issabel', config_file).
+    Pick the PJSIP custom config file for the TLS transport block.
 
-    FreePBX  — has pjsip.transports.conf auto-generated by FreePBX;
-               override by writing [0.0.0.0-tls] into pjsip.transports_custom_post.conf
-               (included after the auto-generated file → values win).
-
-    Issabel 5 (PJSIP) — no pjsip.transports.conf; uses pjsip_custom_post.conf
-                         → write a new [opdesk-sip-tls] transport there.
+    Pure-Asterisk mode: write the `[opdesk-sip-tls]` transport into the first
+    existing of `pjsip_custom_post.conf` / `pjsip_custom.conf`, falling back to
+    `/etc/asterisk/pjsip_custom_post.conf`. Returns (mode, config_file) where
+    `mode` is always `"asterisk"`.
     """
-    if os.path.isfile("/etc/asterisk/pjsip.transports.conf"):
-        return "freepbx", PJSIP_TRANSPORTS_CUSTOM
-
     for candidate in ("/etc/asterisk/pjsip_custom_post.conf",
                       "/etc/asterisk/pjsip_custom.conf"):
         if os.path.isfile(candidate):
-            return "issabel", candidate
+            return "asterisk", candidate
 
-    return "issabel", "/etc/asterisk/pjsip_custom_post.conf"
+    return "asterisk", "/etc/asterisk/pjsip_custom_post.conf"
 
 
 def _write_to_file(path: str, content: str) -> bool:
@@ -551,46 +498,28 @@ def enable_sip_tls(domain: str) -> bool:
     mode, config_file = _detect_tls_mode()
     log.info(f"SIP TLS mode detected: {mode} → {config_file}")
 
-    if mode == "freepbx":
-        # Complete transport definition. pjsip.transports_custom.conf is included
-        # INSIDE pjsip.transports.conf BEFORE the auto-generated [0.0.0.0-tls], and
-        # PJSIP uses first-wins for duplicate object names — so this complete section
-        # wins and the auto-generated one is rejected as a duplicate.
-        # method=tlsv1_2 is required on OpenSSL 3.x (the FreePBX default "sslv23"
-        # throws "no protocols available" because SSLv3/TLS1.0/1.1 are disabled).
-        content = (
-            f"{_TLS_MARKER_START}\n"
-            f"[0.0.0.0-tls]\n"
-            f"type=transport\n"
-            f"protocol=tls\n"
-            f"bind=0.0.0.0:5061\n"
-            f"cert_file={cert}\n"
-            f"priv_key_file={key}\n"
-            f"method=tlsv1_2\n"
-            f"verify_client=no\n"
-            f"verify_server=no\n"
-            f"{_TLS_MARKER_END}\n"
-        )
-    else:
-        # Issabel 5 (PJSIP) — add a dedicated transport to the shared custom file
-        content_prefix = ""
-        if os.path.isfile(config_file):
-            r = subprocess.run(["sudo", "cat", config_file], capture_output=True)
-            content_prefix = r.stdout.decode(errors="replace").rstrip("\n") + "\n"
-        new_block = (
-            f"\n{_TLS_MARKER_START}\n"
-            f"[opdesk-sip-tls]\n"
-            f"type=transport\n"
-            f"protocol=tls\n"
-            f"bind=0.0.0.0:5061\n"
-            f"cert_file={cert}\n"
-            f"priv_key_file={key}\n"
-            f"method=tlsv1_2\n"
-            f"verify_client=no\n"
-            f"verify_server=no\n"
-            f"{_TLS_MARKER_END}\n"
-        )
-        content = content_prefix + new_block
+    # Pure-Asterisk: append a dedicated [opdesk-sip-tls] transport to the shared
+    # pjsip custom file. method=tlsv1_2 is required on OpenSSL 3.x (the
+    # default "sslv23" throws "no protocols available" because SSLv3 / TLS 1.0
+    # / 1.1 are disabled).
+    content_prefix = ""
+    if os.path.isfile(config_file):
+        r = subprocess.run(["sudo", "cat", config_file], capture_output=True)
+        content_prefix = r.stdout.decode(errors="replace").rstrip("\n") + "\n"
+    new_block = (
+        f"\n{_TLS_MARKER_START}\n"
+        f"[opdesk-sip-tls]\n"
+        f"type=transport\n"
+        f"protocol=tls\n"
+        f"bind=0.0.0.0:5061\n"
+        f"cert_file={cert}\n"
+        f"priv_key_file={key}\n"
+        f"method=tlsv1_2\n"
+        f"verify_client=no\n"
+        f"verify_server=no\n"
+        f"{_TLS_MARKER_END}\n"
+    )
+    content = content_prefix + new_block
 
     if not _write_to_file(config_file, content):
         return False

@@ -3,7 +3,7 @@ services:
     image: mariadb:11
     container_name: opdesk-db
     restart: unless-stopped
-    network_mode: host
+    #network_mode: host
     environment:
       MARIADB_ROOT_PASSWORD: OpDeskRoot123!
       # Pre-creates the OpDesk database and grants the OpDesk user on it. The schema
@@ -20,9 +20,7 @@ services:
       # OpDesk's own schema (users/settings/groups/analytics tables + default admin row).
       # Runs once on first initialization of an empty data volume.
       - ./backend/schema.sql:/docker-entrypoint-initdb.d/01-opdesk-schema.sql:ro
-      # CDR table + seed data (pure-Asterisk mode). Without this the call log,
-      # analytics, and Call Journey are empty because the standard FreePBX
-      # asteriskcdrdb.cdr table does not exist. Reads use DB_CDR=OpDesk.
+      # CDR table + seed data. Loaded into the OpDesk database; reads use DB_CDR=OpDesk.
       - ./backend/02-cdr-schema.sql:/docker-entrypoint-initdb.d/02-cdr-schema.sql:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
@@ -34,7 +32,7 @@ services:
     build:
       dockerfile: Dockerfile
     container_name: opdesk
-    network_mode: host
+    #network_mode: host
     restart: unless-stopped
     env_file:
       - ./.env

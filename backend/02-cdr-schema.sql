@@ -5,7 +5,7 @@
 -- queries for the call log + analytics, and seeds a few example rows so the
 -- panel has something to show on first boot.
 --
--- Schema mirrors the standard FreePBX asteriskcdrdb.cdr layout so the existing
+-- Schema follows the standard Asterisk CDR layout so the existing
 -- get_call_log_from_db / get_cdr_by_linkedid / get_call_log_count_from_db
 -- queries work unchanged. Two-leg rows per call (sequence = 1 first leg,
 -- sequence = 2 last leg) reproduce what res_pjsip's cdr_mysql backend writes.

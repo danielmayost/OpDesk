@@ -1,6 +1,6 @@
 # OpDesk — Operator Panel for Asterisk
 
-A real-time operator panel for **Asterisk PBX** (Issabel / FreePBX), similar to **FOP2** but built with a modern React + FastAPI stack. Monitor extensions and queues, manage active calls, view CDR and recordings, use a built-in WebRTC softphone, and analyse call-center performance with a full KPI analytics suite—all in one web app.
+A real-time operator panel for **Asterisk PBX**, similar to **FOP2** but built with a modern React + FastAPI stack. Monitor extensions and queues, manage active calls, view CDR and recordings, use a built-in WebRTC softphone, and analyse call-center performance with a full KPI analytics suite—all in one web app.
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24%2B-43853d.svg)](https://nodejs.org/)
@@ -10,7 +10,7 @@ A real-time operator panel for **Asterisk PBX** (Issabel / FreePBX), similar to 
 
 [Features](#-features) • [Analytics](#-analytics) • [Screenshots](#screenshots) • [Installation](#installation) • [Docker](#-docker-installation-recommended) • [Running](#running) • [Architecture](#architecture) • [Community](#community--support)
 
-Works with **Issabel** and **FreePBX** running Asterisk with AMI and WSS enabled.
+Works with any **Asterisk** install with AMI and WSS enabled.
 
 ---
 
@@ -40,15 +40,15 @@ Works with **Issabel** and **FreePBX** running Asterisk with AMI and WSS enabled
 |-------|-----------|---------------------|---------------------|
 | [![Queue](screenshots/queue.png)](screenshots/queue.png) | [![Softphone](screenshots/softphone.png)](screenshots/softphone.png) | [![Softphone in-call](screenshots/softphone_incall.png)](screenshots/softphone_incall.png) | [![Softphone ringing](screenshots/softphone_rining.png)](screenshots/softphone_rining.png) |
 
-*QoS verified on FreePBX.*
+*QoS verified on Asterisk.*
 
 ---
 
 ## Prerequisites
 
-- Issabel or FreePBX with Asterisk and **AMI** enabled
+- A plain Asterisk install with **AMI** enabled
 - Asterisk plain WebSocket (port 8088) enabled — the installer checks for this automatically
-- MySQL/MariaDB (for FreePBX extension list)
+- MySQL/MariaDB (only the `OpDesk` database is used; the CDR table is created by `02-cdr-schema.sql`)
 - `sudo` and `curl` (for the installer)
 
 The installer can install Python 3.11+, Node.js 24 (via nvm), git, lsof, curl, and Nginx if missing.
@@ -75,28 +75,17 @@ sudo OPDESK_DOMAIN=opdesk.example.com OPDESK_LE_EMAIL=admin@example.com ./instal
 chmod +x install.sh && sudo ./install.sh
 ```
 
-The script clones to `/opt/OpDesk`, installs dependencies, detects Issabel/FreePBX, configures DB and AMI user `OpDesk`, installs and configures **Nginx** as a TLS-terminating reverse proxy on port **443**, obtains a **Let's Encrypt** certificate when `OPDESK_DOMAIN` is set (falls back to self-signed otherwise), and creates `backend/.env`.
+The script clones to `/opt/OpDesk`, installs dependencies, configures the `OpDesk` MySQL user and database, configures the AMI user `OpDesk`, installs and configures **Nginx** as a TLS-terminating reverse proxy on port **443**, obtains a **Let's Encrypt** certificate when `OPDESK_DOMAIN` is set (falls back to self-signed otherwise), and creates `backend/.env`.
 
 OpDesk is then accessible at **`https://<server-ip>`** (LAN) or **`https://<your-domain>`** (public).
 
-> ⚠️ **FreePBX / Issabel use ports 80 and 443 by default.**
-> Both run Apache on ports 80 and 443 for their admin web UI. If you install OpDesk on the same machine, you must move Apache to different ports **before** running `install.sh`, otherwise Nginx will fail to start.
->
-> **FreePBX** — change the HTTP and HTTPS ports:
+> ⚠️ **If another service (e.g. an existing Apache httpd) is already using ports 80/443**, you must move it to different ports **before** running `install.sh`, otherwise Nginx will fail to start.
 > ```bash
 > # HTTP: change port 80 → 8080
 > sudo sed -i 's/\bListen 80\b/Listen 8080/' /etc/httpd/conf/httpd.conf
 > sudo sed -i 's/:80>/:8080>/g' /etc/httpd/conf.d/*.conf
 >
 > # HTTPS: change port 443 → 4443
-> sudo sed -i 's/:443>/:4443>/g; s/^Listen 443/Listen 4443/' /etc/httpd/conf.d/ssl.conf
-> sudo systemctl restart httpd
-> ```
->
-> **Issabel** — same Apache config:
-> ```bash
-> sudo sed -i 's/\bListen 80\b/Listen 8080/' /etc/httpd/conf/httpd.conf
-> sudo sed -i 's/:80>/:8080>/g' /etc/httpd/conf.d/*.conf
 > sudo sed -i 's/:443>/:4443>/g; s/^Listen 443/Listen 4443/' /etc/httpd/conf.d/ssl.conf
 > sudo systemctl restart httpd
 > ```
@@ -301,7 +290,7 @@ The service runs as the user who executed the installer, restarts automatically 
 - **Database (MySQL / MariaDB)**:
   - Stores:
     - User accounts, roles, and assignments (which extensions/queues a supervisor can see).
-    - Cached **extension / queue** metadata (synced from FreePBX/Issabel).
+    - Cached **extension / queue** metadata (synced live from Asterisk over AMI).
     - CDR snapshots and **Call Journey** timelines.
     - **Notifications** (`call_notifications` table with auto‑cleanup via MySQL event).
     - CRM configuration and audit fields.
@@ -316,7 +305,7 @@ The service runs as the user who executed the installer, restarts automatically 
 - **Asterisk / PBX integration**:
   - Uses **AMI** for signaling, monitoring, and call control (originate, spy/whisper/barge, transfers).
   - Uses plain WebSocket on `127.0.0.1:8088` for SIP-over-WebSocket; Nginx adds TLS at `/sip-ws` so the browser connects over WSS.
-  - OpDesk does **not** replace the PBX dialplan; it observes and controls calls through AMI while FreePBX/Issabel continues to own dialplan logic.
+  - OpDesk does **not** replace the PBX dialplan; it observes and controls calls through AMI while Asterisk continues to own dialplan logic.
 
 ## 📊 Analytics
 
@@ -384,7 +373,7 @@ keeping a background socket alive. Two push paths cover both app states:
 
 - **App killed** — a dialplan hook fires *before* SIP contact resolution, CURLs
   `/api/internal/mobile-wake/<ext>` to send the wake push, waits for the app to re-register,
-  then hands the call back to FreePBX normally.
+  then hands the call back to the operator's dialplan normally.
 - **App backgrounded** — Asterisk emits `DialBegin` as usual; the AMI handler calls
   `push_service.send_call_wake()` which sends a high-priority FCM data message (Android /
   `flutter_callkit_incoming`) or an APNs VoIP push via PushKit (iOS / CallKit). On missed call,

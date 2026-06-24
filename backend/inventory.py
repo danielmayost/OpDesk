@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Live AMI inventory cache (pure-Asterisk mode).
+Live AMI inventory cache.
 
-On FreePBX/Issabel, OpDesk reads the extension list, extension display names and
-queue names from the FreePBX MySQL schema (users / sip / ps_endpoints / queues_config).
-A plain Asterisk install has no such database, so instead we discover this inventory
-live from Asterisk over AMI (PJSIPShowEndpoints / SIPpeers / QueueSummary) and cache it
-here. db_manager reads from this cache so the rest of the app is unchanged.
+Discover the extension list, extension display names and queue names directly from
+Asterisk over AMI (PJSIPShowEndpoints / SIPpeers / QueueSummary) and cache them here.
+db_manager reads from this cache so the rest of the app sees a single inventory source.
 
 The AMI monitor calls set_inventory() at startup and on every "sync"; the getters are
 safe to call from synchronous code (they only read in-memory dicts under a lock).
