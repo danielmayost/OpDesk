@@ -9,6 +9,7 @@ and supervisor features (listen/whisper/barge) via Asterisk Manager Interface.
 import logging
 import os
 import re
+import uuid
 import asyncio
 from typing import Dict, Optional, List, Set, Callable, Awaitable
 from datetime import datetime, timedelta
@@ -217,17 +218,22 @@ class AMIExtensionsMonitor:
         try:
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
             self.connected = True
-            
-            # Read banner
+
+            # Read banner (an unsolicited greeting frame with no Response/ActionID).
             await self._read_async()
-            
-            # Login
-            login_msg = f"Action: Login\r\nUsername: {self.username}\r\nSecret: {self.secret}\r\n\r\n"
-            self.writer.write(login_msg.encode())
-            await self.writer.drain()
-            
-            resp = await self._read_async()
-            if 'Response: Success' in resp:
+
+            # Login — use an ActionID so we can distinguish our Login Response from
+            # the storm of unsolicited events Asterisk emits right after a restart
+            # (SuccessfulAuth, FullyBooted, Registry, ...). Otherwise the reader
+            # picks up an Event frame and treats it as a failed auth.
+            actionid = f"opdesk-login-{uuid.uuid4().hex[:12]}"
+            login_msg = (f"Action: Login\r\nUsername: {self.username}\r\n"
+                         f"Secret: {self.secret}\r\nActionID: {actionid}\r\n\r\n")
+            async with self._read_lock:
+                self.writer.write(login_msg.encode())
+                await self.writer.drain()
+                resp = await self._read_response_for_actionid(actionid)
+            if resp and 'Response: Success' in resp:
                 log.info("Connected & authenticated to AMI at %s:%d", self.host, self.port)
                 # Reset the read lock and per-connection buffers so a fresh connection
                 # (e.g. after Asterisk restart) starts clean rather than reusing state
@@ -333,22 +339,83 @@ class AMIExtensionsMonitor:
         async with self._read_lock:
             return await self._read_async_unlocked(timeout)
 
+    async def _read_response_for_actionid(self, actionid: str, timeout: float = AMI_TIMEOUT) -> Optional[str]:
+        """Read AMI frames until the Response matching `actionid` is found.
+
+        Unsolicited Event frames (and any non-matching Response) that arrive
+        while waiting are stashed into ``_pending_events_buffer`` so the
+        background event reader dispatches them instead of being lost.
+
+        This is essential after an Asterisk restart: Asterisk floods the socket
+        with events (SuccessfulAuth, FullyBooted, Registry, ...). Without
+        ActionID correlation the first frame read would be an event, not the
+        Response, causing spurious "Auth failed" / reconnect loops.
+
+        Caller must hold ``_read_lock``.
+        """
+        if not self.reader:
+            return None
+        deadline = asyncio.get_event_loop().time() + timeout
+        carry = ""
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                if carry:
+                    self._pending_events_buffer += carry
+                return None
+            try:
+                data = await asyncio.wait_for(self.reader.read(4096), timeout=remaining)
+            except asyncio.TimeoutError:
+                if carry:
+                    self._pending_events_buffer += carry
+                return None
+            except asyncio.CancelledError:
+                raise
+            if not data:
+                if carry:
+                    self._pending_events_buffer += carry
+                return None
+            carry += data.decode('utf-8', errors='ignore')
+            # Process every complete frame we currently have.
+            while AMI_RESPONSE_END in carry:
+                frame, carry = carry.split(AMI_RESPONSE_END, 1)
+                frame += AMI_RESPONSE_END
+                p = _parse(frame)
+                # A Response to *our* action (ActionID always echoed by Asterisk).
+                if p.get('Response') is not None and p.get('ActionID', '') == actionid:
+                    # Any trailing bytes are live events for the event reader.
+                    if carry:
+                        self._pending_events_buffer += carry
+                    return frame
+                # Otherwise it's an unsolicited event or a foreign response:
+                # hand it to the event reader rather than dropping it.
+                self._pending_events_buffer += frame
+            # No matching response yet — keep reading.
+
     async def _send_async(self, action: str, params: Optional[Dict[str,str]] = None) -> Optional[str]:
-        """Async send action to AMI and wait for response. Uses lock to prevent concurrent reads."""
+        """Async send action to AMI and wait for the matching Response.
+
+        Uses an ActionID to correlate the response, so stray events that arrive
+        on the wire (common right after an Asterisk restart) are drained to the
+        event buffer instead of being mistaken for the action's response.
+        Uses lock to prevent concurrent reads.
+        """
         if not self.connected or not self.writer:
             return None
-        
+
+        actionid = f"opdesk-{uuid.uuid4().hex[:12]}"
         parts = [f"Action: {action}\r\n"]
         if params:
             parts.extend(f"{k}: {v}\r\n" for k, v in params.items())
+        parts.append(f"ActionID: {actionid}\r\n")
         parts.append("\r\n")
         cmd = ''.join(parts)
-        
+
         async with self._read_lock:
             try:
                 self.writer.write(cmd.encode())
                 await self.writer.drain()
-                return await self._read_async_unlocked()
+                return await self._read_response_for_actionid(actionid)
             except Exception as e:
                 log.error("Send %s failed: %s", action, e)
                 # Mark the socket dead so the supervised event loop reconnects
