@@ -192,6 +192,7 @@ class AMIEventBridge:
         self._broadcast_task: Optional[asyncio.Task] = None
         self._state_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._extension_names: Dict[str, str] = {}  # Cache extension names
+        self._resync_lock: asyncio.Lock = asyncio.Lock()  # Guard concurrent sync_active_calls
     
     async def start(self):
         """Start the event bridge."""
@@ -239,9 +240,21 @@ class AMIEventBridge:
             self._state_queue.put_nowait(event)
     
     async def _broadcast_state_loop(self):
-        """Periodically broadcast state and process event queue."""
+        """Periodically broadcast state and process event queue.
+
+        Also runs a periodic reconciliation resync against Asterisk so the panel
+        self-heals when AMI events are missed or lost (e.g. right after a
+        reconnect, or when an event arrives out of order). Without this, stale
+        active_calls entries can persist and the UI stops reflecting reality.
+        """
         last_broadcast = datetime.now()
-        
+        last_resync = datetime.now()
+        RESYNC_INTERVAL = 60  # seconds between background reconciliations
+        # _resync_lock prevents overlapping sync_active_calls calls between
+        # the periodic resync here and /api endpoints (e.g. on_call_action
+        # sync_active_calls, list_active_calls). Without this, a slow AMI
+        # Status response on one path can race with another.
+
         while self._running:
             try:
                 # Process queued events with debouncing
@@ -252,11 +265,33 @@ class AMIEventBridge:
                         events_processed += 1
                     except asyncio.QueueEmpty:
                         break
-                
-                # Broadcast current state every 500ms or when events occur
+
                 now = datetime.now()
+                # Periodically reconcile live state with Asterisk so missed/stale
+                # events don't freeze the UI. Skipped while AMI is disconnected
+                # (the supervised event loop will resync on reconnect anyway) and
+                # when another sync_active_calls is already in flight.
+                if (now - last_resync).total_seconds() >= RESYNC_INTERVAL and self.monitor.connected:
+                    last_resync = now
+                    try:
+                        async with self._resync_lock:
+                            await self.monitor.sync_active_calls()
+                    except Exception as e:
+                        log.debug(f"Background resync failed: {e}")
+                
+                # Broadcast current state every 500ms or when events occur.
+                # Skip when AMI is disconnected and we have no live data — avoids
+                # hammering every WebSocket client with empty payloads while the
+                # supervisor keeps retrying a permanently-down Asterisk.
                 if events_processed > 0 or (now - last_broadcast).total_seconds() >= 0.5:
-                    await self._broadcast_current_state()
+                    has_data = (
+                        self.monitor.active_calls
+                        or self.monitor.extensions
+                        or self.monitor.queues
+                        or self.monitor.monitored
+                    )
+                    if self.monitor.connected or has_data:
+                        await self._broadcast_current_state()
                     last_broadcast = now
                 
                 await asyncio.sleep(0.1)
@@ -617,6 +652,53 @@ _pre_woken: Dict[str, float] = {}
 _PRE_WAKE_TTL = 12  # seconds — covers Wait(3) + dial setup + clock slop
 
 
+def _install_ami_callbacks(monitor, manager):
+    """Install AMI event callbacks for call notifications and incoming calls.
+    Shared between the AMI-connected and AMI-failed lifespan branches so the
+    two paths cannot drift apart."""
+    def _on_call_notification_new(ext: str):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(manager.broadcast({"type": "call_notification_new", "extension": ext}))
+            loop.create_task(_dispatch_missed_call_push(ext))
+        except RuntimeError:
+            pass
+    monitor.set_call_notification_callback(_on_call_notification_new)
+
+    def _on_incoming_call(ext: str, caller: str, call_id: str, display_name: str):
+        try:
+            loop = asyncio.get_running_loop()
+            # If a predial VoIP push was already sent for this extension, skip the
+            # second push.  Two VoIP pushes → two CallKit UUIDs → end-call event
+            # lands on the wrong UUID → no SIP BYE → caller stuck.
+            wake_time = _pre_woken.pop(ext, 0.0)
+            if loop.time() - wake_time < _PRE_WAKE_TTL:
+                return
+            loop.create_task(push_service.send_call_wake(ext, caller, call_id, display_name))
+        except RuntimeError:
+            pass
+    monitor.set_incoming_call_callback(_on_incoming_call)
+
+
+async def _start_ami_supervisor_and_bridge(manager, monitor):
+    """Start the supervised AMI event loop and the WebSocket event bridge.
+    Shared between the AMI-connected and AMI-failed lifespan branches."""
+    monitor._supervisor_task = asyncio.create_task(monitor.run_event_loop())
+    bridge = AMIEventBridge(manager, monitor)
+    await bridge.start()
+    return bridge
+
+
+def _maybe_start_analytics():
+    """Start analytics pre-aggregation only when a CDR database is configured.
+    Pure-Asterisk live-monitoring deployments have no MySQL CDR, so we skip
+    it to avoid repeated connection errors."""
+    if os.getenv("DB_CDR", "").strip():
+        asyncio.create_task(analytics_module.start_aggregation_loop())
+    else:
+        log.info("Analytics disabled (DB_CDR not set) — skipping aggregation loop")
+
+
 # ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
@@ -742,46 +824,26 @@ async def lifespan(app: FastAPI):
         # Enable event monitoring (after syncs complete)
         await monitor._send_async('Events', {'EventMask': 'on'})
         monitor.running = True
-        monitor._event_task = asyncio.create_task(monitor._read_events_async())
-
-        def _on_call_notification_new(ext: str):
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(manager.broadcast({"type": "call_notification_new", "extension": ext}))
-                loop.create_task(_dispatch_missed_call_push(ext))
-            except RuntimeError:
-                pass
-        monitor.set_call_notification_callback(_on_call_notification_new)
-
-        def _on_incoming_call(ext: str, caller: str, call_id: str, display_name: str):
-            try:
-                loop = asyncio.get_running_loop()
-                # If a predial VoIP push was already sent for this extension, skip the
-                # second push.  Two VoIP pushes → two CallKit UUIDs → end-call event
-                # lands on the wrong UUID → no SIP BYE → caller stuck.
-                wake_time = _pre_woken.pop(ext, 0.0)
-                if loop.time() - wake_time < _PRE_WAKE_TTL:
-                    return
-                loop.create_task(push_service.send_call_wake(ext, caller, call_id, display_name))
-            except RuntimeError:
-                pass
-        monitor.set_incoming_call_callback(_on_incoming_call)
-
-        # Start event bridge
-        bridge = AMIEventBridge(manager, monitor)
-        await bridge.start()
-
-        # Start analytics pre-aggregation background task only when a CDR database is
-        # configured. Pure-Asterisk live-monitoring deployments have no MySQL CDR, so we
-        # skip it to avoid repeated connection errors.
-        if os.getenv("DB_CDR", "").strip():
-            asyncio.create_task(analytics_module.start_aggregation_loop())
-        else:
-            log.info("Analytics disabled (DB_CDR not set) — skipping aggregation loop")
+        # Use the supervised event loop so OpDesk auto-reconnects when Asterisk
+        # restarts (the bare _read_events_async would exit and never recover).
+        _install_ami_callbacks(monitor, manager)
+        bridge = await _start_ami_supervisor_and_bridge(manager, monitor)
+        _maybe_start_analytics()
 
         log.info("🎯 Server ready - tracking realtime AMI events")
     else:
-        log.error("Failed to connect to AMI")
+        log.error("Failed to connect to AMI — supervisor will keep retrying in the background")
+        # Fall back to DB extensions so the UI has something to show, and start
+        # the supervised event loop + bridge so OpDesk auto-connects as soon as
+        # Asterisk comes back up (instead of requiring a manual restart).
+        db_exts = get_extensions_from_db()
+        if db_exts:
+            monitor.monitored = set(str(e) for e in db_exts)
+            log.info(f"Monitoring {len(db_exts)} extensions from DB (until AMI is available)")
+        monitor.running = True
+        _install_ami_callbacks(monitor, manager)
+        bridge = await _start_ami_supervisor_and_bridge(manager, monitor)
+        _maybe_start_analytics()
     
     yield
     

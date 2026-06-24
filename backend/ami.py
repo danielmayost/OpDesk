@@ -53,6 +53,11 @@ __all__ = [
 AMI_RESPONSE_END = '\r\n\r\n'
 AMI_TIMEOUT      = 5.0
 EVENT_TIMEOUT    = 1.0
+AMI_RECONNECT_DELAY = 3.0   # seconds between reconnect attempts when AMI drops
+AMI_RECONNECT_MAX_DELAY = 30.0  # backoff cap
+AMI_RECONNECT_MAX_ATTEMPTS = 20  # before entering a longer cooldown after flapping
+AMI_RECONNECT_COOLDOWN = 300.0   # seconds to pause after AMI_RECONNECT_MAX_ATTEMPTS
+AMI_RECONNECT_QUEUE_SYNC_MIN = 60.0  # skip heavy queue resync if last full sync was within this window
 DIALPLAN_CTX     = {'s','h','i','t','o','a','e','start','hangup','invalid','timeout'}
 DIALED_VARS      = {'EXTEN','DIALEDPEERNUMBER','DIALEDNUMBER','OUTNUM',
                     'DIAL_NUMBER','CALLEDNUM','FROM_DID'}
@@ -169,6 +174,7 @@ class AMIExtensionsMonitor:
         self.connected = False
         self.running   = False
         self._event_task: Optional[asyncio.Task] = None
+        self._supervisor_task: Optional[asyncio.Task] = None  # runs run_event_loop (auto-reconnect)
         self._read_buffer: str = ""  # Buffer for partial messages
         self._read_lock: asyncio.Lock = asyncio.Lock()  # Prevent concurrent reads
         # Leftover bytes from _send_action_with_events: live AMI events that arrived in
@@ -199,6 +205,7 @@ class AMIExtensionsMonitor:
         self.ch2linkedid:  Dict[str, str] = {}    # channel -> linkedid (for tracking related channels)
         self.linkedid2channels: Dict[str, Set[str]] = {}  # linkedid -> set of active channels (to detect final hangup)
         self.linkedid_crm_sent: Set[str] = set()  # "linkedid:uniqueid" -> track which channel instances have already sent CRM data (prevent duplicates)
+        self._last_full_sync_time: float = 0.0  # throttle sync_queue_status() across reconnects
         self._call_notification_callback: Optional[Callable[[str], None]] = None  # optional: (extension) -> None, called when a call_notification row is inserted
         self._incoming_call_callback: Optional[Callable[[str, str, str, str], None]] = None  # optional: (extension, caller, call_id, display_name) -> None, called when a monitored extension starts ringing
 
@@ -222,6 +229,11 @@ class AMIExtensionsMonitor:
             resp = await self._read_async()
             if 'Response: Success' in resp:
                 log.info("Connected & authenticated to AMI at %s:%d", self.host, self.port)
+                # Reset the read lock and per-connection buffers so a fresh connection
+                # (e.g. after Asterisk restart) starts clean rather than reusing state
+                # from the dead socket.
+                self._read_lock = asyncio.Lock()
+                self._pending_events_buffer = ""
                 return True
             log.error("Auth failed: %s", resp)
         except Exception as e:
@@ -232,6 +244,15 @@ class AMIExtensionsMonitor:
     async def disconnect(self):
         """Async disconnect from AMI server."""
         self.running = False
+        
+        # Cancel the supervised event loop (auto-reconnect wrapper) first so it
+        # doesn't immediately reconnect after we tear the socket down.
+        if self._supervisor_task and not self._supervisor_task.done():
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
         
         # Cancel event reading task
         if self._event_task and not self._event_task.done():
@@ -330,6 +351,8 @@ class AMIExtensionsMonitor:
                 return await self._read_async_unlocked()
             except Exception as e:
                 log.error("Send %s failed: %s", action, e)
+                # Mark the socket dead so the supervised event loop reconnects
+                self.connected = False
                 return None
     
     async def _send_action_with_events(self, action: str, params: Optional[Dict[str,str]] = None,
@@ -467,6 +490,151 @@ class AMIExtensionsMonitor:
                 if self.running:
                     log.error("Event read error: %s", e)
                 break
+        
+        # Mark the socket as dead so callers know sync actions will fail until
+        # the connection is re-established. The supervised event loop (start()
+        # in server.py) owns reconnecting.
+        self.connected = False
+
+    def _clear_live_state(self):
+        """Clear per-connection state from the dead socket so stale entries
+        don't persist across reconnects. Preserves configuration-like dicts
+        (monitored, extensions, endpoint_names, queues summary)."""
+        self.active_calls.clear()
+        self.ch2ext.clear()
+        self.ch_callerid.clear()
+        self.destch2ext.clear()
+        self.ch2linkedid.clear()
+        self.linkedid2channels.clear()
+        self.linkedid_crm_sent.clear()
+        self.ch2uniqueid.clear()
+        self.queue_entries.clear()
+        self.queue_members.clear()
+        self.dynamic_members.clear()
+
+    async def _reconnect(self) -> bool:
+        """Reconnect to AMI after a dropped connection.
+
+        Closes the old (dead) socket, clears stale per-connection state,
+        reconnects, re-enables events, and re-syncs live state so the UI
+        reflects reality after an Asterisk restart. Bounded by
+        AMI_RECONNECT_MAX_ATTEMPTS before a longer cooldown to avoid log/CPU
+        storms when Asterisk is permanently down. Safe to call repeatedly.
+        """
+        if not self.running:
+            return False
+
+        # Close any lingering socket from the dead connection
+        self.connected = False
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+            self.writer = None
+            self.reader = None
+
+        # Clear stale per-connection state from the dead socket so we don't
+        # show ghost entries until the next event overwrites them.
+        self._clear_live_state()
+
+        delay = AMI_RECONNECT_DELAY
+        attempts = 0
+        while self.running:
+            attempts += 1
+            log.info("Attempting AMI reconnect (attempt=%d, delay=%.1fs)...", attempts, delay)
+            connected = False
+            if await self.connect():
+                # Verify Events subscription succeeded before declaring ready.
+                # If Events fails (Asterisk not fully up, transient glitch), the
+                # connection looks alive but no events flow, freezing the UI.
+                events_ok = False
+                try:
+                    resp = await self._send_async('Events', {'EventMask': 'on'})
+                    events_ok = bool(resp) and 'Response: Success' in resp
+                    if not events_ok:
+                        log.warning("AMI Events re-subscribe did not return Success: %s",
+                                    (resp or '').split('\r\n')[0])
+                except Exception as e:
+                    log.warning("Failed to re-enable AMI events: %s", e)
+
+                if events_ok:
+                    connected = True
+                    # If we have no monitored extensions (e.g. AMI was down at startup),
+                    # rediscover inventory now that Asterisk is back.
+                    if not self.monitored:
+                        try:
+                            exts = await self.load_inventory()
+                            if exts:
+                                self.monitored = set(str(e) for e in exts)
+                                log.info("Rediscovered %d extensions after reconnect", len(exts))
+                        except Exception as e:
+                            log.warning("Inventory rediscovery after reconnect failed: %s", e)
+                    try:
+                        await self.sync_extension_statuses()
+                        await self.sync_active_calls()
+                        # Throttle heavy queue sync on flapping reconnects.
+                        now_ts = asyncio.get_event_loop().time()
+                        if (now_ts - self._last_full_sync_time) >= AMI_RECONNECT_QUEUE_SYNC_MIN:
+                            await self.sync_queue_status()
+                            self._last_full_sync_time = now_ts
+                    except Exception as e:
+                        log.warning("Post-reconnect sync failed: %s", e)
+                    log.info("AMI reconnected and resynced")
+                else:
+                    # Events didn't enable — close the just-opened socket so the
+                    # supervisor retries cleanly instead of blocking on a quiet
+                    # connection that will never deliver events.
+                    if self.writer:
+                        try:
+                            self.writer.close()
+                            await self.writer.wait_closed()
+                        except Exception:
+                            pass
+                        self.writer = None
+                        self.reader = None
+                    self.connected = False
+
+            if connected:
+                return True
+
+            # Exponential backoff capped at AMI_RECONNECT_MAX_DELAY; after
+            # AMI_RECONNECT_MAX_ATTEMPTS, pause for a longer cooldown so a
+            # permanently-down Asterisk doesn't fill logs/CPU forever.
+            await asyncio.sleep(delay)
+            if attempts >= AMI_RECONNECT_MAX_ATTEMPTS:
+                log.warning("AMI reconnect hit %d attempts — cooling down for %.0fs",
+                            attempts, AMI_RECONNECT_COOLDOWN)
+                await asyncio.sleep(AMI_RECONNECT_COOLDOWN)
+                attempts = 0
+            delay = min(delay * 2, AMI_RECONNECT_MAX_DELAY)
+        return False
+
+    async def run_event_loop(self):
+        """Supervised event loop: reads AMI events and auto-reconnects when
+        the connection drops (e.g. Asterisk restart).
+
+        This replaces a bare `asyncio.create_task(monitor._read_events_async())`
+        call — when `_read_events_async` returns because the socket died, this
+        wrapper reconnects and starts reading again, so the panel never freezes
+        waiting for a manual OpDesk restart.
+        """
+        while self.running:
+            if not self.connected:
+                if not await self._reconnect():
+                    # running was cleared during reconnect backoff — exit
+                    break
+            # Read until the socket dies; _read_events_async returns when the
+            # connection is closed/cancelled.
+            try:
+                await self._read_events_async()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error("Unexpected error in event loop: %s", e)
+                self.connected = False
+            # Loop back: if still running, reconnect and resume.
 
     # ------------------------------------------------------------------
     # Call-info helpers
@@ -1710,6 +1878,27 @@ class AMIExtensionsMonitor:
                 new_status = dialstatus.upper() if dialstatus else ''
                 if new_status == 'ANSWER' or dest_current_status != 'ANSWER':
                     dest_info['dialstatus'] = dialstatus
+
+        # If the dial failed to connect (no ANSWER), the destination extension's
+        # active_calls entry — created speculatively by DialBegin/_cross_ref — is
+        # now stale: there is no live call leg to it. Remove it so the UI doesn't
+        # keep showing an inactive/unreachable extension as "In Calling".
+        failed = dialstatus.upper() not in ('', 'ANSWER') if dialstatus else False
+        if dest_ext and failed:
+            dest_info = self.active_calls.get(dest_ext)
+            # Only drop the entry if it clearly belongs to THIS dial leg.
+            # Require explicit identity linkage (channel == destch, OR
+            # caller == ext when no channel was set by _cross_ref) so we
+            # don't wipe a different live call the destination may already
+            # have when dest_info has no identity at all.
+            channel_match = bool(destch) and dest_info.get('channel') == destch
+            caller_match = bool(ext) and not dest_info.get('channel') and dest_info.get('caller') == ext
+            if dest_info and (channel_match or caller_match):
+                self.active_calls.pop(dest_ext, None)
+                # Drop the caller->destch mapping for this dial leg only.
+                # destch2ext is keyed by destination channel with caller ext as value,
+                # so we filter by the specific destch, not by dest_ext.
+                self.destch2ext = {k: v for k, v in self.destch2ext.items() if k != destch}
 
     def _ev_Bridge(self, p, ts):
         ch1, ch2 = p.get('Channel1',''), p.get('Channel2','')
