@@ -235,10 +235,14 @@ class AMIExtensionsMonitor:
                 resp = await self._read_response_for_actionid(actionid)
             if resp and 'Response: Success' in resp:
                 log.info("Connected & authenticated to AMI at %s:%d", self.host, self.port)
-                # Reset the read lock and per-connection buffers so a fresh connection
-                # (e.g. after Asterisk restart) starts clean rather than reusing state
-                # from the dead socket.
-                self._read_lock = asyncio.Lock()
+                # Reset the per-connection event buffer so a fresh connection (e.g.
+                # after an Asterisk restart) starts clean rather than reusing stale
+                # bytes from the dead socket. Do NOT replace _read_lock here: a stable
+                # lock instance is required so that in-flight sync actions (e.g. the
+                # periodic resync in _broadcast_state_loop) keep mutual exclusion
+                # with the event reader and the new socket. Replacing it created a
+                # window where two coroutines read the same socket concurrently,
+                # desyncing the AMI protocol.
                 self._pending_events_buffer = ""
                 return True
             log.error("Auth failed: %s", resp)
@@ -619,9 +623,16 @@ class AMIExtensionsMonitor:
                 events_ok = False
                 try:
                     resp = await self._send_async('Events', {'EventMask': 'on'})
-                    events_ok = bool(resp) and 'Response: Success' in resp
+                    # The Events action returns "Response: Success" with the echoed
+                    # ActionID. _send_async drains unsolicited events (FullyBooted,
+                    # SuccessfulAuth, ...) via ActionID correlation. Accept any
+                    # Response frame as success; a non-Response (stray event) or
+                    # None indicates a protocol desync.
+                    events_ok = bool(resp) and (
+                        'Response: Success' in resp or resp.startswith('Response:')
+                    )
                     if not events_ok:
-                        log.warning("AMI Events re-subscribe did not return Success: %s",
+                        log.warning("AMI Events re-subscribe did not return a Response: %s",
                                     (resp or '').split('\r\n')[0])
                 except Exception as e:
                     log.warning("Failed to re-enable AMI events: %s", e)
@@ -650,18 +661,20 @@ class AMIExtensionsMonitor:
                         log.warning("Post-reconnect sync failed: %s", e)
                     log.info("AMI reconnected and resynced")
                 else:
-                    # Events didn't enable — close the just-opened socket so the
-                    # supervisor retries cleanly instead of blocking on a quiet
-                    # connection that will never deliver events.
-                    if self.writer:
-                        try:
-                            self.writer.close()
-                            await self.writer.wait_closed()
-                        except Exception:
-                            pass
-                        self.writer = None
-                        self.reader = None
-                    self.connected = False
+                    # Events re-subscribe didn't return a Response (likely a
+                    # transient AMI protocol desync right after an Asterisk
+                    # restart). Login already succeeded, so DON'T tear the socket
+                    # down and retry — that caused an infinite connect/disconnect
+                    # loop (visible in Asterisk as repeated Login/Logoff). Instead
+                    # proceed: the event reader will start, and if the socket is
+                    # genuinely unusable it will be detected and reconnected
+                    # naturally. Re-send Events once more defensively.
+                    log.warning("AMI Events re-subscribe inconclusive — proceeding with event reader")
+                    try:
+                        await self._send_async('Events', {'EventMask': 'on'})
+                    except Exception:
+                        pass
+                    connected = True
 
             if connected:
                 return True
@@ -1496,18 +1509,25 @@ class AMIExtensionsMonitor:
                 # Linkedid exists but no channel tracking - treat as final
                 is_final_hangup = True
                 log.info(f"✅ Final channel hung up for Linkedid {linkedid} (no channel tracking) - will send CRM data")
-            # Remove this channel from Linkedid tracking
-            self.linkedid2channels[linkedid].discard(ch)
-            # Clean up empty Linkedid entry if no channels remain
-            if not self.linkedid2channels[linkedid]:
-                self.linkedid2channels.pop(linkedid, None)
-                # Also clean up linkedid_crm_sent entries for this Linkedid (keys are "linkedid:uniqueid")
-                # This handles the case where Asterisk reuses Linkedid for queue re-rings
-                keys_to_remove = [k for k in self.linkedid_crm_sent if k.startswith(f"{linkedid}:")]
-                for k in keys_to_remove:
-                    self.linkedid_crm_sent.discard(k)
-                if keys_to_remove:
-                    log.debug(f"🧹 Cleaned up Linkedid {linkedid} tracking (all channels gone, removed {len(keys_to_remove)} CRM tracking keys)")
+            # Remove this channel from Linkedid tracking. Guard with .get(): the
+            # else-branch above (linkedid present but not tracked in
+            # linkedid2channels, e.g. a hangup for a channel whose Newchannel we
+            # never saw, or right after a reconnect cleared live state) leaves the
+            # key absent — accessing it directly raised KeyError and crashed the
+            # event reader.
+            channels_for_linkedid = self.linkedid2channels.get(linkedid)
+            if channels_for_linkedid is not None:
+                channels_for_linkedid.discard(ch)
+                # Clean up empty Linkedid entry if no channels remain
+                if not channels_for_linkedid:
+                    self.linkedid2channels.pop(linkedid, None)
+                    # Also clean up linkedid_crm_sent entries for this Linkedid (keys are "linkedid:uniqueid")
+                    # This handles the case where Asterisk reuses Linkedid for queue re-rings
+                    keys_to_remove = [k for k in self.linkedid_crm_sent if k.startswith(f"{linkedid}:")]
+                    for k in keys_to_remove:
+                        self.linkedid_crm_sent.discard(k)
+                    if keys_to_remove:
+                        log.debug(f"🧹 Cleaned up Linkedid {linkedid} tracking (all channels gone, removed {len(keys_to_remove)} CRM tracking keys)")
             # Clean up channel to Linkedid mapping
             self.ch2linkedid.pop(ch, None)
         else:
