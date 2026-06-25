@@ -42,6 +42,7 @@ services:
     # Without this, code changes require a full `docker compose build` to take effect.
     volumes:
       - ./backend:/opt/opdesk/backend:rw
+      - ./recording:/opt/opdesk/recording:rw
     depends_on:
       mariadb:
         condition: service_healthy

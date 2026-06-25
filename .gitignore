@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+build/
+dist/
+node_modules/
+.vite/
+
+# Database dumps / recordings / runtime data
+recording/
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+demo.mp3

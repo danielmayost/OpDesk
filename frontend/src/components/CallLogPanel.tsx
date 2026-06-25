@@ -219,7 +219,12 @@ function AudioPlayer({ recordingPath, recordingFile }: AudioPlayerProps) {
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!audioRef.current || !duration) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    let pct = (e.clientX - rect.left) / rect.width;
+    const isRtl =
+      getComputedStyle(e.currentTarget).direction === 'rtl' ||
+      document.documentElement.dir === 'rtl';
+    if (isRtl) pct = 1 - pct;
+    pct = Math.max(0, Math.min(1, pct));
     audioRef.current.currentTime = pct * duration;
   };
 
