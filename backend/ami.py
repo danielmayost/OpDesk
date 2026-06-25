@@ -469,6 +469,15 @@ class AMIExtensionsMonitor:
                     elapsed = asyncio.get_event_loop().time() - start_time
                     if elapsed >= timeout:
                         log.warning(f"{action}: Timeout waiting for {complete_event}")
+                        # On timeout the accumulated buffer may contain live events
+                        # (Hangup, Newchannel, DeviceStateChange, ...) that arrived
+                        # interleaved with the partial action response. Hand them to
+                        # the event reader so they are dispatched instead of dropped —
+                        # otherwise critical state changes (e.g. a trunk going idle)
+                        # are lost and the UI freezes on its last known state.
+                        leftover = ''.join(chunks)
+                        if leftover:
+                            self._pending_events_buffer += leftover
                         break
                     
                     try:
@@ -913,6 +922,16 @@ class AMIExtensionsMonitor:
         # Use _send_action_with_events to get all Status events until StatusComplete
         resp = await self._send_action_with_events('Status', complete_event='StatusComplete')
         if not resp:
+            return self.active_calls
+
+        # If we never received the StatusComplete marker, the response is partial
+        # (typically a timeout). Do NOT replace live state with partial/empty data,
+        # otherwise active calls vanish from the UI while the real Asterisk
+        # channels are still up. Live events handed to the event reader will
+        # reconcile state instead. (Note: _send_action_with_events already routed
+        # the partial buffer to the event reader on timeout.)
+        if 'Event: StatusComplete' not in resp:
+            log.warning("sync_active_calls: StatusComplete not seen — keeping existing live state")
             return self.active_calls
 
         # Build new state without clearing existing data first
@@ -3271,8 +3290,15 @@ class AMIExtensionsMonitor:
             log.error("❌ Not connected to AMI")
             return False
 
-        await self.sync_active_calls()
-        ch = await self.get_active_channel(ext)
+        # Resolve the channel from the live event-driven cache first, WITHOUT
+        # running sync_active_calls(). The sync issues an AMI Status action that
+        # can time out and — worse — replaces active_calls with partial data,
+        # wiping the cached channel entry before we ever send the Hangup action.
+        # The event reader keeps the cache authoritative; only fall back to a
+        # live query when the cache has nothing for this extension.
+        ch = self.get_active_channel_sync(ext)
+        if not ch:
+            ch = await self.get_active_channel(ext)
         if not ch:
             log.error(f"❌ No active call on extension {ext}")
             return False
