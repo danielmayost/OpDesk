@@ -38,6 +38,10 @@ services:
       - ./.env
     ports:
       - "8765:8765"
+    # Mount backend as a volume so file edits on the host trigger WatchFiles reload.
+    # Without this, code changes require a full `docker compose build` to take effect.
+    volumes:
+      - ./backend:/opt/opdesk/backend:rw
     depends_on:
       mariadb:
         condition: service_healthy

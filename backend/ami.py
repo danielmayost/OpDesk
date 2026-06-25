@@ -514,7 +514,101 @@ class AMIExtensionsMonitor:
             except Exception as e:
                 log.error("Send %s failed: %s", action, e)
                 return None
-    
+
+    async def _send_sipshowpeer(self, peer: str, timeout: float = 3.0) -> Optional[str]:
+        """
+        Send AMI `SIPshowpeer` and read until the response goes quiet.
+
+        Unlike most AMI actions, SIPshowpeer does NOT emit a "*Complete" event
+        — it returns Response: Success plus one or more PeerEntry events, then
+        stops. Reading until ~400ms of silence is the most reliable way to
+        capture the full body without timing out on a missing marker.
+        """
+        if not self.connected or not self.writer:
+            return None
+        cmd = f"Action: SIPshowpeer\r\nPeer: {peer}\r\n\r\n"
+        async with self._read_lock:
+            try:
+                self.writer.write(cmd.encode())
+                await self.writer.drain()
+                chunks = []
+                start = asyncio.get_event_loop().time()
+                while True:
+                    elapsed = asyncio.get_event_loop().time() - start
+                    if elapsed >= timeout:
+                        break
+                    try:
+                        data = await asyncio.wait_for(
+                            self.reader.read(4096),
+                            timeout=min(0.4, max(0.05, timeout - elapsed)),
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data.decode('utf-8', errors='ignore'))
+                    # If we already saw Response: Success and have at least one
+                    # blank-line terminator after it, we have the full payload.
+                    full = ''.join(chunks)
+                    if 'Response: Success' in full and full.count('\r\n\r\n') >= 2:
+                        break
+                return ''.join(chunks)
+            except Exception as e:
+                log.error("SIPshowpeer %s failed: %s", peer, e)
+                return None
+
+    async def _send_command(self, command: str, timeout: float = 5.0) -> Optional[str]:
+        """
+        Send `Action: Command` and read the full response.
+
+        chan_sip does not expose the callerid name through AMI actions
+        (SIPshowpeer returns no CallerID field). The only way to get it
+        from chan_sip is the CLI command `sip show peer <ext>`.
+
+        Asterisk's CLI command response uses `Response: Success` /
+        `Message: Command output follows` with `Output: ` prefixed lines
+        and no trailing `--END COMMAND RESPONSE--` marker (that was the
+        legacy form). Termination is detected by ~1.2 s of silence after
+        the response begins.
+        """
+        if not self.connected or not self.writer:
+            return None
+        cmd = f"Action: Command\r\nCommand: {command}\r\n\r\n"
+        async with self._read_lock:
+            try:
+                self.writer.write(cmd.encode())
+                await self.writer.drain()
+                chunks = []
+                start = asyncio.get_event_loop().time()
+                seen_response = False
+                silence_windows = 0
+                while True:
+                    elapsed = asyncio.get_event_loop().time() - start
+                    if elapsed >= timeout:
+                        break
+                    try:
+                        data = await asyncio.wait_for(
+                            self.reader.read(4096),
+                            timeout=min(0.4, max(0.05, timeout - elapsed)),
+                        )
+                    except asyncio.TimeoutError:
+                        if seen_response:
+                            silence_windows += 1
+                            if silence_windows >= 3:  # ~1.2s of silence after Response
+                                break
+                        continue
+                    if not data:
+                        break
+                    chunks.append(data.decode('utf-8', errors='ignore'))
+                    silence_windows = 0
+                    full = ''.join(chunks)
+                    if not seen_response and 'Response:' in full:
+                        seen_response = True
+                return ''.join(chunks)
+            except Exception as e:
+                log.error("Command %r failed: %s", command, e)
+                return None
+
     async def _read_events_async(self):
         """Event-driven async event reader - continuously reads events from AMI.
         Uses lock to prevent concurrent reads with command responses."""
@@ -1745,8 +1839,20 @@ class AMIExtensionsMonitor:
                 # Remove the extension from active calls
                 self.active_calls.pop(ext, None)
             elif ext_info and ext_info.get('destchannel') == ch:
-                # This was a destination channel, just remove the reference
-                ext_info.pop('destchannel', None)
+                # This was a destination channel. If the call never reached an
+                # answered state (still Ringing/Dialing/etc.) this hangup IS
+                # the only event we'll ever get for that speculative entry
+                # (e.g. the destination extension is inactive/unregistered, so
+                # Asterisk never creates its main channel). Removing it here
+                # prevents the card from staying stuck on "calling" until the
+                # 60s periodic resync runs. When the call was already answered
+                # (state == Up/Busy — e.g. a transfer leg) we keep the entry
+                # alive because the original channel is still up.
+                if ext_info.get('state') in ('Ringing', 'Ring', 'Dialing', 'New'):
+                    self.active_calls.pop(ext, None)
+                    log.debug(f"🧹 Removed speculative Ringing entry for {ext} (inactive destination hangup, channel {ch})")
+                else:
+                    ext_info.pop('destchannel', None)
             elif ext_info:
                 # Channel doesn't match exactly, but if it's the final hangup and we have ext_info, still send CRM data
                 if is_final_hangup:
@@ -1820,9 +1926,16 @@ class AMIExtensionsMonitor:
                     # This call's main channel hung up - remove the entry
                     self.active_calls.pop(ext_name, None)
                 elif info.get('destchannel') == ch:
-                    # This call's destination channel hung up - just clear destchannel reference
-                    # Don't remove the entry - caller's own channel might still be active
-                    info.pop('destchannel', None)
+                    # Same logic as the primary branch: if the call never
+                    # reached an answered state, this destination hangup is
+                    # the only one we'll see — pop the speculative entry so
+                    # the UI doesn't stay stuck on "calling" until the next
+                    # periodic resync.
+                    if info.get('state') in ('Ringing', 'Ring', 'Dialing', 'New'):
+                        self.active_calls.pop(ext_name, None)
+                        log.debug(f"🧹 Removed speculative Ringing entry for {ext_name} (inactive destination hangup, channel {ch})")
+                    else:
+                        info.pop('destchannel', None)
 
     def _ev_NewCallerid(self, p, ts):
         ch = p.get('Channel', '')
@@ -3028,6 +3141,48 @@ class AMIExtensionsMonitor:
             except Exception as e:
                 log.debug("SIPpeers not available: %s", e)
 
+            # chan_sip's SIPpeers PeerEntry AND SIPshowpeer action BOTH omit CallerID.
+            # The only way to read the display name from chan_sip is the CLI
+            # command `sip show peer <ext>`, which is wrapped in a
+            # `Response: Follows` / `--END COMMAND RESPONSE--` envelope.
+            try:
+                peer_list = sorted(names.keys(), key=lambda e: (0, int(e)) if e.isdigit() else (1, e))
+                log.info("   Resolving %d peer(s) via `sip show peer`...", len(peer_list))
+                for ext in peer_list:
+                    resp = await self._send_command(f"sip show peer {ext}")
+                    if not resp:
+                        log.warning("   sip show peer %s: empty response", ext)
+                        continue
+                    # Parse the Output:-prefixed text body. Each line is:
+                    #   Output:   Callerid     : "Name" <number>
+                    # or for a peer without callerid:
+                    #   Output:   Callerid     : "" <>
+                    cid_name = None
+                    for line in resp.split('\r\n'):
+                        # Strip the "Output:" envelope prefix (case-insensitive, optional).
+                        body = re.sub(r'^Output:\s*', '', line, flags=re.IGNORECASE).strip()
+                        if not body:
+                            continue
+                        # Match "Callerid ..." (allow leading "* " sometimes).
+                        m = re.match(r'^\*?\s*Callerid\s*[:=]\s*(.*)$', body, re.IGNORECASE)
+                        if not m:
+                            continue
+                        value = m.group(1).strip()
+                        # Strip trailing "<number>" portion.
+                        value = re.sub(r'\s*<\s*\S*\s*>\s*$', '', value).strip()
+                        # Strip surrounding quotes (single or double).
+                        value = value.strip().strip('"').strip("'").strip()
+                        if value:
+                            cid_name = value
+                        break  # only first Callerid line
+                    if cid_name and cid_name != ext:
+                        names[ext] = cid_name
+                        log.info("   📛 %s → %s", ext, cid_name)
+                    else:
+                        log.info("   📛 %s → (no name in `sip show peer`)", ext)
+            except Exception as e:
+                log.warning("sip show peer fallback failed: %s", e)
+
         # --- queues ---
         try:
             summary = await self.get_queue_summary()
@@ -3045,6 +3200,10 @@ class AMIExtensionsMonitor:
             log.warning("Failed to publish inventory cache: %s", e)
 
         log.info("📇 Inventory from AMI: %d extension(s), %d queue(s)", len(names), len(queues))
+        if names:
+            log.debug("   Resolved names: %s",
+                      ", ".join(f"{e}={n}" for e, n in sorted(names.items(),
+                                      key=lambda kv: (0, int(kv[0])) if kv[0].isdigit() else (1, kv[0]))))
 
         def _sort_key(e: str):
             return (0, int(e)) if e.isdigit() else (1, e)
