@@ -1049,11 +1049,18 @@ class AMIExtensionsMonitor:
             # Only format timestamp if needed (for logging when extensions are monitored)
             ts = datetime.now().strftime('%H:%M:%S') if self.monitored else ''
             
-            # Call handler (sync handlers are fine, but we support async too)
-            if asyncio.iscoroutinefunction(handler):
-                await handler(p, ts)
-            else:
-                handler(p, ts)
+            # Call handler (sync handlers are fine, but we support async too).
+            # Isolate handler errors: a single malformed/edge-case event must
+            # never escape here — _read_events_async treats any propagated
+            # exception as a dead socket and force-reconnects AMI (causing the
+            # logout/login storm seen on duplicate DialEnd events).
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(p, ts)
+                else:
+                    handler(p, ts)
+            except Exception as e:
+                log.error("Handler %s error: %s", ev, e)
             
             # Call registered event callbacks
             for callback in self._event_callbacks:
@@ -2091,14 +2098,22 @@ class AMIExtensionsMonitor:
             # caller == ext when no channel was set by _cross_ref) so we
             # don't wipe a different live call the destination may already
             # have when dest_info has no identity at all.
-            channel_match = bool(destch) and dest_info.get('channel') == destch
-            caller_match = bool(ext) and not dest_info.get('channel') and dest_info.get('caller') == ext
-            if dest_info and (channel_match or caller_match):
-                self.active_calls.pop(dest_ext, None)
-                # Drop the caller->destch mapping for this dial leg only.
-                # destch2ext is keyed by destination channel with caller ext as value,
-                # so we filter by the specific destch, not by dest_ext.
-                self.destch2ext = {k: v for k, v in self.destch2ext.items() if k != destch}
+            #
+            # NOTE: Asterisk can emit DialEnd twice for the same leg (e.g. on
+            # caller hangup while ringing). The first DialEnd pops the entry
+            # below, so the duplicate finds dest_info=None. Guard the .get()
+            # calls with `dest_info and ...` — accessing attributes on None
+            # here previously raised AttributeError, which killed the event
+            # reader and forced an AMI logout/reconnect.
+            if dest_info:
+                channel_match = bool(destch) and dest_info.get('channel') == destch
+                caller_match = bool(ext) and not dest_info.get('channel') and dest_info.get('caller') == ext
+                if channel_match or caller_match:
+                    self.active_calls.pop(dest_ext, None)
+                    # Drop the caller->destch mapping for this dial leg only.
+                    # destch2ext is keyed by destination channel with caller ext as value,
+                    # so we filter by the specific destch, not by dest_ext.
+                    self.destch2ext = {k: v for k, v in self.destch2ext.items() if k != destch}
 
     def _ev_Bridge(self, p, ts):
         ch1, ch2 = p.get('Channel1',''), p.get('Channel2','')
