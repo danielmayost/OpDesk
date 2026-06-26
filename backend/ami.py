@@ -1864,6 +1864,30 @@ class AMIExtensionsMonitor:
                 
                 # Remove the extension from active calls
                 self.active_calls.pop(ext, None)
+
+                # Also remove speculative callee entries that _cross_ref created
+                # for this caller (caller == ext) but that never received a real
+                # channel of their own. This happens for dial paths where
+                # Asterisk never builds a destination channel (e.g. WebRTC/App
+                # originated calls, or an unregistered/inactive destination) —
+                # no Hangup event will ever arrive for such a callee, so without
+                # this sweep its card stays frozen on "in calling" until the
+                # periodic 60s resync eventually clears it (and that resync
+                # itself bails out on a StatusComplete timeout, extending the
+                # freeze). Only drop entries that are clearly speculative: no
+                # real channel, caller pointing back to us, and still in a
+                # pre-answer state — a genuinely answered callee always has a
+                # channel and is handled by its own Hangup above.
+                for callee_ext, callee_info in list(self.active_calls.items()):
+                    if callee_ext == ext:
+                        continue
+                    if callee_info.get('channel'):
+                        continue
+                    if callee_info.get('caller') != ext:
+                        continue
+                    if callee_info.get('state') in ('Ringing', 'Ring', 'Dialing', 'New', '', None):
+                        self.active_calls.pop(callee_ext, None)
+                        log.debug(f"🧹 Removed speculative orphan entry for {callee_ext} (caller {ext} hung up, channel {ch})")
             elif ext_info and ext_info.get('destchannel') == ch:
                 # This was a destination channel. If the call never reached an
                 # answered state (still Ringing/Dialing/etc.) this hangup IS
