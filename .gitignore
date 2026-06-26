@@ -22,6 +22,8 @@ recording/
 Thumbs.db
 desktop.ini
 
+.env
+
 # IDE / editor
 .idea/
 .vscode/
