@@ -2012,9 +2012,19 @@ class AMIExtensionsMonitor:
             info = self._call_info(ext)
             info['destination'] = p.get('Destination','')
             info['dialstatus']  = p.get('DialStatus','')
-            dialed = p.get('DialString', p.get('Dialstring','')) or p.get('DestExten','')
+            dialed = p.get('DestExten','') or p.get('DialString', p.get('Dialstring',''))
+            # Normalize "TECH/EXTEN[@context]" -> "EXTEN" so a Dial(SIP/3003) yields
+            # "3003", not the tech prefix "SIP".
+            if dialed and '/' in dialed:
+                dialed = dialed.split('@', 1)[0].split('/', 1)[1].strip()
             if _meaningful(dialed):
-                info.setdefault('original_destination', dialed)
+                # Overwrite original_destination while the call is still being set
+                # up (not answered). Newchannel may have stored the entrypoint exten
+                # (e.g. a speed-dial/alias) from the dialplan Exten field; the Dial
+                # event reveals the actual peer. After answer, keep the first real
+                # party (transfer / CRM semantics).
+                if not info.get('answer_time') or 'original_destination' not in info:
+                    info['original_destination'] = dialed
                 info['exten'] = dialed
 
     def _ev_DialBegin(self, p, ts):
@@ -2040,20 +2050,36 @@ class AMIExtensionsMonitor:
             info['start_time'] = datetime.now()
             info['answer_time'] = None
 
-        # Resolve the actual dialed number
+        # Resolve the actual dialed number. Try DestExten first, then DialString,
+        # then fall back to extracting from DestChannel (most reliable for the
+        # TECH/EXTEN-xxx naming used by chan_sip/PJSIP — e.g. SIP/3003-00000001).
         dialed = None
         if _meaningful(destexten):
             dialed = destexten
         elif dialstring:
-            # Optimize: split once and check
-            parts = dialstring.split('@', 1)
-            candidate = parts[0].split('/', 1)[0].strip()
-            if _meaningful(candidate):
-                dialed = candidate
+            # DialString may be "EXTEN@context" or "TECH/EXTEN[@context]". Take the
+            # part after the tech prefix when a slash is present, otherwise the part
+            # before '@'.
+            ds = dialstring.split('@', 1)[0]
+            if '/' in ds:
+                ds = ds.split('/', 1)[1]
+            ds = ds.strip()
+            if _meaningful(ds):
+                dialed = ds
+        if not dialed and destch:
+            dest_ext_from_ch = _ext_from_channel(destch)
+            if dest_ext_from_ch and dest_ext_from_ch not in DIALPLAN_CTX:
+                dialed = dest_ext_from_ch
 
         if dialed:
             info['exten'] = dialed
-            if 'original_destination' not in info:
+            # Overwrite original_destination with the real dialed peer while the
+            # call is still being set up (not yet answered). Newchannel may have
+            # stored the entrypoint exten (e.g. a speed-dial/alias such as 1234)
+            # from the dialplan Exten field; the Dial reveals the actual peer
+            # (e.g. 3003). After answer, keep the first real party so transfers
+            # and CRM reporting retain the original destination.
+            if not info.get('answer_time') or 'original_destination' not in info:
                 info['original_destination'] = dialed
             if dialed != ext:
                 self._cross_ref(ext, dialed)
